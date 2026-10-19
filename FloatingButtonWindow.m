@@ -38,6 +38,12 @@
     【问题三：错误被 error:nil 吞掉，界面上看不出失效】
     现在 setCategory / setActive / play 全部检查返回值，
     失败原因直接写在浮窗 toast 上；长按浮窗可随时查看实时状态。
+
+    【问题四：进程被挂起，但界面上看不出来】
+    音频会话是活动的，不代表进程真的在跑。iOS 把进程挂起时，
+    音频对象照样报 isPlaying = YES，定时器却全部停摆（广告倒计时不走就是这个）。
+    现在每 5 秒打一次心跳，回到前台时用墙钟时间对比，算出后台被挂起了多久，
+    直接显示在 toast 上。这是判断"到底有没有被挂起"的唯一可靠依据。
 */
 
 #import "FloatingButtonWindow.h"
@@ -54,6 +60,8 @@
 @property (nonatomic, assign) BOOL audioOK;
 @property (nonatomic, copy) NSString *audioLastError;
 @property (nonatomic, assign) BOOL suppressStateToast;
+@property (nonatomic, assign) NSTimeInterval lastHeartbeat;
+@property (nonatomic, assign) NSTimeInterval suspendedGap;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @end
 
@@ -440,6 +448,9 @@ static NSData *makeInaudibleWav(void) {
         return @"At Rest";
     }
     if (self.audioOK) {
+        if (self.suspendedGap > 3.0) {
+            return [NSString stringWithFormat:@"音频运行中 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+        }
         return @"Immortalized · 音频运行中";
     }
     NSString *reason = self.audioLastError;
@@ -485,15 +496,40 @@ static NSData *makeInaudibleWav(void) {
 
     [center addObserverForName:UIApplicationWillEnterForegroundNotification
                         object:nil
-                         queue:[NSOperationQueue mainQueue]
+                         queue:nil
                     usingBlock:^(NSNotification *note) {
+        [weakSelf measureSuspensionGap];
         [weakSelf ensureAudioRunning];
+        [weakSelf showStatusToast];
     }];
+}
+
+/*
+    回到前台的第一时间，用墙钟时间和最后一次心跳对比。
+    进程要是被挂起了，定时器整段时间都没走，缺口会非常大；
+    如果进程真的在跑，缺口最多就是一个 5 秒的巡检周期再加一点抖动。
+    注意：这个观察者必须用 queue:nil 同步执行，否则会被恢复的定时器抢先，
+    拿到一个"看起来很健康"的假数据。
+*/
+- (void)measureSuspensionGap {
+    if (self.lastHeartbeat <= 0) {
+        return;
+    }
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    NSTimeInterval gap = now - self.lastHeartbeat - 5.0;
+    if (gap > 3.0) {
+        self.suspendedGap = gap;
+    } else {
+        self.suspendedGap = 0;
+    }
 }
 
 - (void)startTimer {
     [self.timer invalidate];
     self.timer = nil;
+
+    self.suspendedGap = 0;
+    self.lastHeartbeat = [NSDate date].timeIntervalSince1970;
 
     [self ensureAudioRunning];
 
@@ -525,6 +561,8 @@ static NSData *makeInaudibleWav(void) {
 }
 
 - (void)timerFired {
+    self.lastHeartbeat = [NSDate date].timeIntervalSince1970;
+
     if (!self.isImmortalized) {
         return;
     }
@@ -532,6 +570,14 @@ static NSData *makeInaudibleWav(void) {
         return;
     }
     [self ensureAudioRunning];
+}
+
+- (NSString *)formatDuration:(NSTimeInterval)seconds {
+    NSInteger total = (NSInteger)llround(seconds);
+    if (total < 60) {
+        return [NSString stringWithFormat:@"%ld 秒", (long)total];
+    }
+    return [NSString stringWithFormat:@"%ld 分 %ld 秒", (long)(total / 60), (long)(total % 60)];
 }
 
 - (void)ensureAudioRunning {
