@@ -16,24 +16,18 @@
 */
 
 /*
-    ===== 修改说明 v4（2026-10，针对"进程还活着但倒计时冻结"）=====
+    ===== 修改说明 v5（2026-10，针对"通知拦住了但倒计时仍冻结"）=====
 
-    原来的三个 hook 只处理了 scene 的 settings diff（foreground = No 等），
-    但广告 SDK 暂停倒计时靠的是通知，不是 scene 状态：
-        UIApplicationWillResignActiveNotification   ← 失焦，广告最常见的是这个
-        UIApplicationDidEnterBackgroundNotification
-    只要这两个通知送到 App，开屏广告 / 激励视频就会立刻 pause，定时器被 invalidate。
+    v4 已经把 willResignActive / didEnterBackground 通知挡住了（计数器能到两位数），
+    但倒计时还是不动，说明广告 / 播放器看的不是通知，而是 scene 的失活状态。
+    iOS 27 上"失活"由 settings diff 里的 deactivationReasons 表达，
+    而原来的过滤条件里只有 foreground = No，漏掉了这一条。
 
-    本次在 NSNotificationCenter 的发帖入口上做一层过滤：
-    勾了保活之后，这两个通知以及对应的 UIScene 版本不再投递给 App 内部的监听者，
-    广告就以为"我一直在前台"，倒计时继续走。
+    v5 在 scene hook 里补上 deactivationReasons 的过滤，并记录拦截次数
+    （immortalizer_scene_drop_count），浮窗长按可以看到。
 
-    同时 applicationState 改为恒返回 Active（只对 UserNotifications / PushKit
-    的调用方如实返回），避免 App 通过状态查询自己得出"我在后台"的结论。
-
-    被拦截的次数会写进 NSUserDefaults 的 immortalizer_swallow_count，
-    浮窗长按时可以看 —— 如果这个数字一直是 0，说明压根没有失焦通知发出，
-    那倒计时就是被 CADisplayLink / 视频渲染停掉的，代码层面无解。
+    如果这个次数在涨、倒计时仍然不动，那基本可以确定倒计时是被渲染层掐的
+    （CADisplayLink 停止、视频不渲染、WKWebView 不可见），应用层 hook 到不了那里。
 */
 
 #import <objc/runtime.h>
@@ -59,6 +53,15 @@ void new_sceneID_updateWithSettingsDiff_transitionContext_completion(id self, SE
     }
 
     NSString *diffDescription = [arg2 description];
+
+    /* v5：iOS 27 上"失活"不走前台标记，走 deactivationReasons。
+       广告 / 播放器会把它当成"App 被切走了"，据此暂停倒计时。这里一并吞掉。 */
+    if ([diffDescription containsString:@"deactivationReasons"]) {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSInteger count = [defaults integerForKey:@"immortalizer_scene_drop_count"];
+        [defaults setInteger:count + 1 forKey:@"immortalizer_scene_drop_count"];
+        return;
+    }
 
     if ([diffDescription containsString:@"foreground = NotSet"] || 
         [diffDescription containsString:@"foreground = No"] || 

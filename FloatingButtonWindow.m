@@ -438,8 +438,10 @@ static NSData *makeInaudibleWav(void) {
     NSString *subtitle = [self statusText];
 
     NSInteger swallowed = [[NSUserDefaults standardUserDefaults] integerForKey:@"immortalizer_swallow_count"];
-    if (swallowed > 0) {
-        subtitle = [subtitle stringByAppendingFormat:@" · 拦%ld", (long)swallowed];
+    NSInteger sceneDropped = [[NSUserDefaults standardUserDefaults] integerForKey:@"immortalizer_scene_drop_count"];
+
+    if (swallowed > 0 || sceneDropped > 0) {
+        subtitle = [subtitle stringByAppendingFormat:@" · 拦%ld/场%ld", (long)swallowed, (long)sceneDropped];
     }
 
     CustomToastView *toastView = [[CustomToastView alloc] initWithTitle:appName subtitle:subtitle
