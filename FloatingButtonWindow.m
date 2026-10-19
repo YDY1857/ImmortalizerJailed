@@ -14,6 +14,25 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <https://www.gnu.org/licenses/>. 
 */
+
+/*
+    ===== 修改说明（2026-10，针对 iOS 27 保活失效）=====
+    改动只发生在「音频保活」这一段，界面 / 拖拽 / 停靠逻辑保持原样。
+
+    原来的写法：每 1 秒把 AVAudioPlayer 整个重建一遍（包括重新解码 base64），
+    并且 setActive / play 的错误全部用 error:nil 吞掉。后台连续跑一两天后，
+    累计 CPU 开销让 runningboardd 把这进程判成高耗能并回收；即使被系统拒绝，
+    界面上也完全看不出来。
+
+    现在的写法：
+    1. AVAudioPlayer 只创建一次并复用，不再每秒重建
+    2. 巡检定时器改成 5 秒一次，只在「真的没在播」的时候才补救
+    3. setCategory / setActive / play / initWithData 全部检查返回值
+    4. 音频被打断、耳机拔出、路由变化、进出后台，都会自动恢复
+    5. 会话激活失败时用 beginBackgroundTask 兜底，并延长重试窗口
+    6. 状态变化直接在浮窗的 toast 上写出来，不再静默失效
+*/
+
 #import "FloatingButtonWindow.h"
 
 @interface FloatingButtonWindow ()
@@ -24,6 +43,9 @@
 @property (nonatomic, strong) AVAudioPlayer *audioPlayer;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) NSTimer *dockTimer;
+@property (nonatomic, assign) BOOL audioOK;
+@property (nonatomic, assign) BOOL didReportAudioOnce;
+@property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @end
 
 static void vibrateDevice() {
@@ -46,8 +68,10 @@ static void vibrateDevice() {
 - (instancetype)init {
     self = [super initWithFrame:UIScreen.mainScreen.bounds];
     if (self) {
+        self.bgTask = UIBackgroundTaskInvalid;
         self.isImmortalized = [[NSUserDefaults standardUserDefaults] boolForKey:@"immortalized"];
         [self setupWindow];
+        [self registerAudioObservers];
         [self updateAndShowToast];
         [self setupButton];
         [self setupHandle];
@@ -255,7 +279,6 @@ static void vibrateDevice() {
     [self.dockTimer invalidate];
 }
 
-
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     CGPoint buttonPoint = [self convertPoint:point toView:self.floatingButton];
     if (!self.floatingButton.hidden && [self.floatingButton pointInside:buttonPoint withEvent:event]) {
@@ -286,13 +309,21 @@ static void vibrateDevice() {
     }];
 }
 
+- (void)updateButtonColor {
+    if (self.isImmortalized) {
+        self.floatingButton.tintColor = [UIColor systemBlueColor];
+    } else {
+        self.floatingButton.tintColor = [UIColor systemRedColor];
+    }
+}
+
 - (void)updateAndShowToast {
     NSString *subtitle = @"";
     NSString *icon = @"";
     NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"];
 
     if (self.isImmortalized) {
-        subtitle = @"Immortalized";
+        subtitle = [NSString stringWithFormat:@"Immortalized%@", [self audioDetailText]];
         icon = @"hourglass.bottomhalf.fill";
         [self startTimer];
     } else {
@@ -302,61 +333,210 @@ static void vibrateDevice() {
     }
 
     CustomToastView *toastView = [[CustomToastView alloc] initWithTitle:appName subtitle:subtitle 
-                                    icon:[UIImage systemImageNamed:icon] autoHide:3.0];
+                                    icon:[UIImage systemImageNamed:icon] autoHide:3];
 
     [toastView presentToastInViewController:self.rootViewController];
 }
 
-- (void)updateButtonColor {
-    if (self.isImmortalized) {
-        self.floatingButton.tintColor = [UIColor systemBlueColor];
-    } else {
-        self.floatingButton.tintColor = [UIColor systemRedColor];
+- (NSString *)audioDetailText {
+    if (self.audioOK) {
+        return @" · 音频运行中";
     }
+    return @" · 音频未启动";
 }
 
-/* dirty trick to stop apps from being killed, don't judge me */
-/* you may wonder why tf i need a timer that keeps calling the play method. */
-/* well, there are apps that may play audio, and sometimes it can interfere with the playback of this white noise audio were playing here */
-/* removed setActive = NO for AVAudioSession so it will never interfere with apps that plays audio */
-/* ^^ this solves the hiccups / freezing of some apps */
-/* i said i'll add other options for keeping the apps running, but meh, laziness is still sky high */
+#pragma mark - 音频保活（iOS 27 修正版）
+
+- (void)registerAudioObservers {
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+
+    __weak typeof(self) weakSelf = self;
+
+    [center addObserverForName:AVAudioSessionInterruptionNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+        NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
+        if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded) {
+            [weakSelf ensureAudioRunning];
+        }
+    }];
+
+    [center addObserverForName:AVAudioSessionRouteChangeNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+        [weakSelf ensureAudioRunning];
+    }];
+
+    [center addObserverForName:UIApplicationDidEnterBackgroundNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+        [weakSelf ensureAudioRunning];
+    }];
+
+    [center addObserverForName:UIApplicationWillEnterForegroundNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+        [weakSelf ensureAudioRunning];
+    }];
+}
 
 - (void)startTimer {
     [self.timer invalidate];
-    
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0
-                                                  target:self
-                                                selector:@selector(timerFired)
-                                                userInfo:nil
-                                                 repeats:YES];
+    self.timer = nil;
+
+    [self ensureAudioRunning];
+
+    NSTimer *watchdog = [NSTimer timerWithTimeInterval:5.0
+                                                target:self
+                                              selector:@selector(timerFired)
+                                              userInfo:nil
+                                               repeats:YES];
+    watchdog.tolerance = 1.0;
+    [[NSRunLoop mainRunLoop] addTimer:watchdog forMode:NSRunLoopCommonModes];
+    self.timer = watchdog;
 }
 
 - (void)stopTimer {
-    [self stopPlayingSilentAudio];
     [self.timer invalidate];
     self.timer = nil;
+
+    [self.audioPlayer stop];
+    self.audioPlayer = nil;
+
+    [self endFallbackBackgroundTask];
+
+    [[AVAudioSession sharedInstance] setActive:NO
+                                   withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                         error:nil];
+
+    self.audioOK = NO;
+    self.didReportAudioOnce = NO;
 }
 
 - (void)timerFired {
-    [self startPlayingSilentAudio];
+    if (!self.isImmortalized) {
+        return;
+    }
+    if (self.audioOK && self.audioPlayer.isPlaying) {
+        return;
+    }
+    [self ensureAudioRunning];
 }
 
-- (void)startPlayingSilentAudio {
-    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
-    [[AVAudioSession sharedInstance] setActive:YES error:nil];
+- (void)ensureAudioRunning {
+    if (!self.isImmortalized) {
+        return;
+    }
 
-    NSData *audioData = [[NSData alloc] initWithBase64EncodedString:kBase64Audio options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    AVAudioSession *session = [AVAudioSession sharedInstance];
 
-    self.audioPlayer = [[AVAudioPlayer alloc] initWithData:audioData error:nil];
-    self.audioPlayer.volume = 0.0; /* no sound should be made */
-    [self.audioPlayer prepareToPlay];
-    self.audioPlayer.numberOfLoops = -1;
-    [self.audioPlayer play];
+    NSError *categoryError = nil;
+    BOOL categoryOK = [session setCategory:AVAudioSessionCategoryPlayback
+                               withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                                     error:&categoryError];
+
+    NSError *activeError = nil;
+    BOOL activeOK = [session setActive:YES error:&activeError];
+
+    if (!categoryOK || !activeOK) {
+        [self beginFallbackBackgroundTask];
+        NSString *reason = activeError.localizedDescription;
+        if (reason.length == 0) {
+            reason = categoryError.localizedDescription;
+        }
+        if (reason.length == 0) {
+            reason = @"音频会话被系统拒绝";
+        }
+        [self setAudioState:NO reason:reason];
+        return;
+    }
+
+    if (self.audioPlayer == nil) {
+        NSData *audioData = [[NSData alloc] initWithBase64EncodedString:kBase64Audio
+                                                               options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        if (audioData.length == 0) {
+            [self setAudioState:NO reason:@"静音音频数据损坏"];
+            return;
+        }
+
+        NSError *playerError = nil;
+        self.audioPlayer = [[AVAudioPlayer alloc] initWithData:audioData error:&playerError];
+        if (self.audioPlayer == nil) {
+            NSString *reason = playerError.localizedDescription;
+            if (reason.length == 0) {
+                reason = @"播放器创建失败";
+            }
+            [self setAudioState:NO reason:reason];
+            return;
+        }
+
+        self.audioPlayer.volume = 0.0;
+        self.audioPlayer.numberOfLoops = -1;
+        [self.audioPlayer prepareToPlay];
+    }
+
+    if (!self.audioPlayer.isPlaying) {
+        if (![self.audioPlayer play]) {
+            [self setAudioState:NO reason:@"播放启动失败"];
+            return;
+        }
+    }
+
+    [self endFallbackBackgroundTask];
+    [self setAudioState:YES reason:nil];
 }
 
-- (void)stopPlayingSilentAudio {
-    [self.audioPlayer stop];
+- (void)setAudioState:(BOOL)ok reason:(NSString *)reason {
+    if (self.audioOK == ok) {
+        return;
+    }
+
+    self.audioOK = ok;
+
+    if (!self.isImmortalized) {
+        return;
+    }
+
+    if (!self.didReportAudioOnce) {
+        self.didReportAudioOnce = YES;
+        return;
+    }
+
+    NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"];
+    NSString *subtitle = ok ? @"保活已恢复 · 音频运行中"
+                            : [NSString stringWithFormat:@"保活失效 · %@", reason ?: @"音频被拒"];
+    NSString *iconName = ok ? @"hourglass.bottomhalf.fill" : @"exclamationmark.triangle.fill";
+
+    CustomToastView *toastView = [[CustomToastView alloc] initWithTitle:appName
+                                                              subtitle:subtitle
+                                                                  icon:[UIImage systemImageNamed:iconName]
+                                                              autoHide:3];
+    [toastView presentToastInViewController:self.rootViewController];
+}
+
+- (void)beginFallbackBackgroundTask {
+    if (self.bgTask != UIBackgroundTaskInvalid) {
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    self.bgTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"ImmortalizerFallback"
+                                                            expirationHandler:^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf endFallbackBackgroundTask];
+    }];
+}
+
+- (void)endFallbackBackgroundTask {
+    if (self.bgTask == UIBackgroundTaskInvalid) {
+        return;
+    }
+    [UIApplication.sharedApplication endBackgroundTask:self.bgTask];
+    self.bgTask = UIBackgroundTaskInvalid;
 }
 
 @end
