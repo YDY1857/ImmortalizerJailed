@@ -16,24 +16,32 @@
 */
 
 /*
-    ===== 修改说明（2026-10，针对 iOS 27 保活失效）=====
+    ===== 修改说明 v2（2026-10，针对 iOS 27 保活失效）=====
+
     改动只发生在「音频保活」这一段，界面 / 拖拽 / 停靠逻辑保持原样。
 
-    原来的写法：每 1 秒把 AVAudioPlayer 整个重建一遍（包括重新解码 base64），
-    并且 setActive / play 的错误全部用 error:nil 吞掉。后台连续跑一两天后，
-    累计 CPU 开销让 runningboardd 把这进程判成高耗能并回收；即使被系统拒绝，
-    界面上也完全看不出来。
+    【问题一：音频负载本身是错的】
+    原来内嵌的 kBase64Audio 是一段满刻度噪声（峰值 100%、RMS 24%），
+    靠 volume = 0 压成无声。系统看到的是一个音量恒为 0 的音频流，
+    iOS 27 对「零输出电平」的后台音频越来越不宽容。
 
-    现在的写法：
-    1. AVAudioPlayer 只创建一次并复用，不再每秒重建
-    2. 巡检定时器改成 5 秒一次，只在「真的没在播」的时候才补救
-    3. setCategory / setActive / play / initWithData 全部检查返回值
-    4. 音频被打断、耳机拔出、路由变化、进出后台，都会自动恢复
-    5. 会话激活失败时用 beginBackgroundTask 兜底，并延长重试窗口
-    6. 状态变化直接在浮窗的 toast 上写出来，不再静默失效
+    现在改为运行时合成 18 Hz 超低频正弦波，音量 1.0：
+    - 有真实、非零的采样数据和输出电平
+    - 18 Hz 低于人耳下限，手机扬声器也根本放不出来，实际听感为零
+    - 不再需要内嵌 60KB 的 base64，代码里直接算出来
+
+    【问题二：每 1 秒重建一次播放器】
+    原来每秒 [[AVAudioPlayer alloc] initWithData:...] 一次，一天 8.6 万次，
+    后台 CPU 预算被耗光后进程被 runningboardd 回收。现在只建一次并复用，
+    巡检改成 5 秒一次，只在真的没在播时才补救。
+
+    【问题三：错误被 error:nil 吞掉，界面上看不出失效】
+    现在 setCategory / setActive / play 全部检查返回值，
+    失败原因直接写在浮窗 toast 上；长按浮窗可随时查看实时状态。
 */
 
 #import "FloatingButtonWindow.h"
+#import <math.h>
 
 @interface FloatingButtonWindow ()
 @property (nonatomic, strong) UIButton *floatingButton;
@@ -44,7 +52,8 @@
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) NSTimer *dockTimer;
 @property (nonatomic, assign) BOOL audioOK;
-@property (nonatomic, assign) BOOL didReportAudioOnce;
+@property (nonatomic, copy) NSString *audioLastError;
+@property (nonatomic, assign) BOOL suppressStateToast;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @end
 
@@ -52,6 +61,68 @@ static void vibrateDevice() {
     UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
     [feedback prepare];
     [feedback impactOccurred];
+}
+
+/*
+    合成一段 16bit / 22050Hz / 单声道 的 2 秒正弦波。
+
+    频率 18 Hz：低到人耳听不见，手机扬声器（几百 Hz 以下就急剧衰减）
+    也根本发不出这个频段，所以听感上等于静音。
+    但采样数据是真实的非零波形，输出电平也是真的，
+    系统判定「正在播放音频」时不会被当成空流。
+
+    想微调就改这两个常量：
+    frequency 再低一点更保险，amplitude 越小越安静。
+*/
+static const double kKeepAliveFrequency = 18.0;
+static const double kKeepAliveAmplitude = 0.10;
+
+static NSData *makeInaudibleWav(void) {
+    static NSData *cached = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const uint32_t sampleRate = 22050;
+        const uint32_t frameCount = sampleRate * 2;
+
+        uint32_t dataSize = frameCount * 2;
+        uint32_t riffSize = 36 + dataSize;
+        uint32_t fmtSize = 16;
+        uint16_t audioFormat = 1;
+        uint16_t channels = 1;
+        uint32_t byteRate = sampleRate * channels * 2;
+        uint16_t blockAlign = channels * 2;
+        uint16_t bitsPerSample = 16;
+
+        NSMutableData *wav = [NSMutableData dataWithCapacity:44 + dataSize];
+
+        [wav appendBytes:"RIFF" length:4];
+        [wav appendBytes:&riffSize length:4];
+        [wav appendBytes:"WAVE" length:4];
+        [wav appendBytes:"fmt " length:4];
+        [wav appendBytes:&fmtSize length:4];
+        [wav appendBytes:&audioFormat length:2];
+        [wav appendBytes:&channels length:2];
+        [wav appendBytes:&sampleRate length:4];
+        [wav appendBytes:&byteRate length:4];
+        [wav appendBytes:&blockAlign length:2];
+        [wav appendBytes:&bitsPerSample length:2];
+        [wav appendBytes:"data" length:4];
+        [wav appendBytes:&dataSize length:4];
+
+        int16_t *samples = (int16_t *)calloc(frameCount, sizeof(int16_t));
+        if (samples != NULL) {
+            for (uint32_t i = 0; i < frameCount; i++) {
+                double t = (double)i / (double)sampleRate;
+                double v = kKeepAliveAmplitude * 32767.0 * sin(2.0 * M_PI * kKeepAliveFrequency * t);
+                samples[i] = (int16_t)lrint(v);
+            }
+            [wav appendBytes:samples length:dataSize];
+            free(samples);
+        }
+
+        cached = [wav copy];
+    });
+    return cached;
 }
 
 @implementation FloatingButtonWindow
@@ -109,6 +180,10 @@ static void vibrateDevice() {
     [_floatingButton addGestureRecognizer:pan];
     
     [_floatingButton addTarget:self action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
+
+    UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPress:)];
+    longPress.minimumPressDuration = 1.0;
+    [_floatingButton addGestureRecognizer:longPress];
     
     [self.rootViewController.view addSubview:_floatingButton];
     [self snapButtonToNearestEdge:_floatingButton];
@@ -309,6 +384,15 @@ static void vibrateDevice() {
     }];
 }
 
+- (void)handleLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) {
+        return;
+    }
+    vibrateDevice();
+    [self ensureAudioRunning];
+    [self showStatusToast];
+}
+
 - (void)updateButtonColor {
     if (self.isImmortalized) {
         self.floatingButton.tintColor = [UIColor systemBlueColor];
@@ -318,19 +402,22 @@ static void vibrateDevice() {
 }
 
 - (void)updateAndShowToast {
-    NSString *subtitle = @"";
     NSString *icon = @"";
     NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"];
 
+    self.suppressStateToast = YES;
+
     if (self.isImmortalized) {
-        subtitle = [NSString stringWithFormat:@"Immortalized%@", [self audioDetailText]];
-        icon = @"hourglass.bottomhalf.fill";
         [self startTimer];
+        icon = @"hourglass.bottomhalf.fill";
     } else {
-        subtitle = @"At Rest";
-        icon = @"arrow.uturn.left.circle.fill";
         [self stopTimer];
+        icon = @"arrow.uturn.left.circle.fill";
     }
+
+    NSString *subtitle = [self statusText];
+
+    self.suppressStateToast = NO;
 
     CustomToastView *toastView = [[CustomToastView alloc] initWithTitle:appName subtitle:subtitle 
                                     icon:[UIImage systemImageNamed:icon] autoHide:3];
@@ -338,11 +425,31 @@ static void vibrateDevice() {
     [toastView presentToastInViewController:self.rootViewController];
 }
 
-- (NSString *)audioDetailText {
-    if (self.audioOK) {
-        return @" · 音频运行中";
+- (void)showStatusToast {
+    NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"];
+    NSString *subtitle = [self statusText];
+
+    CustomToastView *toastView = [[CustomToastView alloc] initWithTitle:appName subtitle:subtitle
+                                                                  icon:[UIImage systemImageNamed:@"info.circle.fill"]
+                                                              autoHide:5];
+    [toastView presentToastInViewController:self.rootViewController];
+}
+
+- (NSString *)statusText {
+    if (!self.isImmortalized) {
+        return @"At Rest";
     }
-    return @" · 音频未启动";
+    if (self.audioOK) {
+        return @"Immortalized · 音频运行中";
+    }
+    NSString *reason = self.audioLastError;
+    if (reason.length == 0) {
+        return @"Immortalized · 音频未启动";
+    }
+    if (reason.length > 22) {
+        reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
+    }
+    return [NSString stringWithFormat:@"音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）
@@ -414,7 +521,7 @@ static void vibrateDevice() {
                                          error:nil];
 
     self.audioOK = NO;
-    self.didReportAudioOnce = NO;
+    self.audioLastError = nil;
 }
 
 - (void)timerFired {
@@ -456,10 +563,9 @@ static void vibrateDevice() {
     }
 
     if (self.audioPlayer == nil) {
-        NSData *audioData = [[NSData alloc] initWithBase64EncodedString:kBase64Audio
-                                                               options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        NSData *audioData = makeInaudibleWav();
         if (audioData.length == 0) {
-            [self setAudioState:NO reason:@"静音音频数据损坏"];
+            [self setAudioState:NO reason:@"音频数据生成失败"];
             return;
         }
 
@@ -474,7 +580,9 @@ static void vibrateDevice() {
             return;
         }
 
-        self.audioPlayer.volume = 0.0;
+        // 音量保持 1.0：18 Hz 本身听不见，不要再用 0 音量去"补一刀"，
+        // 零输出电平正是 iOS 27 不认的地方。
+        self.audioPlayer.volume = 1.0;
         self.audioPlayer.numberOfLoops = -1;
         [self.audioPlayer prepareToPlay];
     }
@@ -491,18 +599,19 @@ static void vibrateDevice() {
 }
 
 - (void)setAudioState:(BOOL)ok reason:(NSString *)reason {
+    if (ok) {
+        self.audioLastError = nil;
+    } else if (reason.length > 0) {
+        self.audioLastError = reason;
+    }
+
     if (self.audioOK == ok) {
         return;
     }
 
     self.audioOK = ok;
 
-    if (!self.isImmortalized) {
-        return;
-    }
-
-    if (!self.didReportAudioOnce) {
-        self.didReportAudioOnce = YES;
+    if (!self.isImmortalized || self.suppressStateToast) {
         return;
     }
 
