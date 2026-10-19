@@ -16,7 +16,7 @@
 */
 
 /*
-    ===== 修改说明 v2（2026-10，针对 iOS 27 保活失效）=====
+    ===== 修改说明 v4（2026-10，针对 iOS 27 保活失效）=====
 
     改动只发生在「音频保活」这一段，界面 / 拖拽 / 停靠逻辑保持原样。
 
@@ -437,6 +437,11 @@ static NSData *makeInaudibleWav(void) {
     NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"];
     NSString *subtitle = [self statusText];
 
+    NSInteger swallowed = [[NSUserDefaults standardUserDefaults] integerForKey:@"immortalizer_swallow_count"];
+    if (swallowed > 0) {
+        subtitle = [subtitle stringByAppendingFormat:@" · 拦%ld", (long)swallowed];
+    }
+
     CustomToastView *toastView = [[CustomToastView alloc] initWithTitle:appName subtitle:subtitle
                                                                   icon:[UIImage systemImageNamed:@"info.circle.fill"]
                                                               autoHide:5];
@@ -449,18 +454,18 @@ static NSData *makeInaudibleWav(void) {
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"音频运行中 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v4 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"Immortalized · 音频运行中";
+        return @"v4 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"Immortalized · 音频未启动";
+        return @"v4 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v4 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）
