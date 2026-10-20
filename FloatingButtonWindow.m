@@ -135,6 +135,26 @@ extern void AdSetJSSpeed(BOOL enabled);
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @property (nonatomic, strong) UIButton *autoKillButton;
 @property (nonatomic, strong) UIButton *jsSpeedButton;
+
+/* 这几个方法定义在下面，但被更早的方法调用（showLogPanel）。
+   显式声明一遍，避免 "instance method not found" 类警告；
+   如果 Makefile 带了 -Werror，那种警告会直接让编译失败。 */
+- (NSString *)buildLogText;
+- (void)showLogPanel;
+- (void)hideLogPanel;
+- (UIStackView *)buildButtonRowWithTitles:(NSArray<NSString *> *)titles
+                                selectors:(NSArray<NSString *> *)selectorNames
+                                    frame:(CGRect)frame;
+- (void)showSimpleToast:(NSString *)text;
+- (void)refreshAutoKillButton;
+- (void)refreshJSSpeedButton;
+- (void)exportReportTapped;
+- (void)copyReportTapped;
+- (void)markTapped;
+- (void)snapshotTapped;
+- (void)adKillTapped;
+- (void)autoKillTapped;
+- (void)jsSpeedTapped;
 @end
 
 static void vibrateDevice() {
