@@ -50,6 +50,21 @@
 #import <math.h>
 
 /*
+    ===== 修改说明 v12（2026-10-20）=====
+
+    修 v11 的入口 bug：v11 把「自动模式」的严格判断（只认开屏/激励三类）也用在了
+    手动秒过的入口上，导致小游戏里只有 BeeVideoPlayerView 时点了没反应。
+
+    面板第一行改成 4 个按钮：导出TXT / 复制全文 / 抓界面 / JS加速:开|关
+      「JS加速」= H5 层的 8 倍速（setInterval + Date.now），只对广告/游戏页生效，
+      给 v11 打不穿的那类"页面自计时广告"兜底。默认开。
+
+    按钮字号 13 → 12（一行 4 个，窄屏不挤）。
+
+    ===== 以下是 v11 的说明，保留备查 =====
+*/
+
+/*
     ===== 修改说明 v11（2026-10-20）=====
 
     面板从一行按钮扩成两行：
@@ -98,6 +113,10 @@ extern NSString *AdKillSummary(void);
 extern BOOL AdAutoKillEnabled(void);
 extern void AdSetAutoKill(BOOL enabled);
 
+/* 由 main.m 提供：H5 加速开关（v12） */
+extern BOOL AdJSSpeedEnabled(void);
+extern void AdSetJSSpeed(BOOL enabled);
+
 @interface FloatingButtonWindow ()
 @property (nonatomic, strong) UIButton *floatingButton;
 @property (nonatomic, strong) UIView *handleView;
@@ -115,6 +134,7 @@ extern void AdSetAutoKill(BOOL enabled);
 @property (nonatomic, assign) NSTimeInterval suspendedGap;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @property (nonatomic, strong) UIButton *autoKillButton;
+@property (nonatomic, strong) UIButton *jsSpeedButton;
 @end
 
 static void vibrateDevice() {
@@ -491,7 +511,7 @@ static NSData *makeInaudibleWav(void) {
         textView.font = mono ?: [UIFont systemFontOfSize:10.0];
 
         UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w - 120, 34)];
-        titleLabel.text = @"AdRecon v11 侦察 + 秒过";
+        titleLabel.text = @"AdRecon v12 侦察 + 秒过";
         titleLabel.textColor = [UIColor whiteColor];
         titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
 
@@ -502,15 +522,19 @@ static NSData *makeInaudibleWav(void) {
         closeButton.titleLabel.font = [UIFont systemFontOfSize:15.0];
         [closeButton addTarget:self action:@selector(hideLogPanel) forControlEvents:UIControlEventTouchUpInside];
 
-        /* 第一行：侦察相关 */
-        UIStackView *row1 = [self buildButtonRowWithTitles:@[@"导出TXT", @"复制全文", @"抓界面"]
-                                                selectors:@[@"exportReportTapped", @"copyReportTapped", @"snapshotTapped"]
+        /* 第一行：侦察 + H5 加速 */
+        UIStackView *row1 = [self buildButtonRowWithTitles:@[@"导出TXT", @"复制全文", @"抓界面", @"JS加速:开"]
+                                                selectors:@[@"exportReportTapped", @"copyReportTapped", @"snapshotTapped", @"jsSpeedTapped"]
                                                     frame:CGRectMake(10, row1Y, w - 20, 40)];
 
         /* 第二行：秒过相关 */
         UIStackView *row2 = [self buildButtonRowWithTitles:@[@"秒过广告", @"自动:关", @"打标记"]
                                                 selectors:@[@"adKillTapped", @"autoKillTapped", @"markTapped"]
                                                     frame:CGRectMake(10, row2Y, w - 20, 40)];
+
+        UIButton *jsButton = (UIButton *)row1.arrangedSubviews[3];
+        self.jsSpeedButton = jsButton;
+        [self refreshJSSpeedButton];
 
         UIButton *autoButton = (UIButton *)row2.arrangedSubviews[1];
         self.autoKillButton = autoButton;
@@ -546,7 +570,7 @@ static NSData *makeInaudibleWav(void) {
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
         [button setTitle:titles[i] forState:UIControlStateNormal];
         [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        button.titleLabel.font = [UIFont systemFontOfSize:13.0];
+        button.titleLabel.font = [UIFont systemFontOfSize:12.0];
         button.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
         button.layer.cornerRadius = 9.0;
         [button addTarget:self
@@ -568,13 +592,35 @@ static NSData *makeInaudibleWav(void) {
         : [UIColor colorWithWhite:0.22 alpha:1.0];
 }
 
+- (void)refreshJSSpeedButton {
+    if (self.jsSpeedButton == nil) {
+        return;
+    }
+    BOOL on = AdJSSpeedEnabled();
+    [self.jsSpeedButton setTitle:(on ? @"JS加速:开" : @"JS加速:关") forState:UIControlStateNormal];
+    self.jsSpeedButton.backgroundColor = on
+        ? [UIColor colorWithRed:0.16 green:0.42 blue:0.78 alpha:1.0]
+        : [UIColor colorWithWhite:0.22 alpha:1.0];
+}
+
+- (void)jsSpeedTapped {
+    BOOL next = !AdJSSpeedEnabled();
+    AdSetJSSpeed(next);
+    [self refreshJSSpeedButton];
+    if (next) {
+        [self showSimpleToast:@"H5 加速已开 · 重新进入广告页才生效"];
+    } else {
+        [self showSimpleToast:@"H5 加速已关 · 已打开的页面不受影响"];
+    }
+}
+
 - (void)adKillTapped {
     NSString *before = AdKillSummary();
     AdKillRun(@"手动点秒过");
     [self showSimpleToast:[NSString stringWithFormat:@"秒过中… 当前 %@", before]];
 
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.6 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         [strongSelf showSimpleToast:[NSString stringWithFormat:@"结果：%@", AdKillSummary()]];
@@ -696,22 +742,22 @@ static NSData *makeInaudibleWav(void) {
 
 - (NSString *)statusText {
     if (!self.isImmortalized) {
-        return @"v11 · 就绪（长按出面板）";
+        return @"v12 · 就绪（长按出面板）";
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v11 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v12 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v11 · 音频运行中";
+        return @"v12 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v11 · 音频未启动";
+        return @"v12 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v11 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v12 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）
