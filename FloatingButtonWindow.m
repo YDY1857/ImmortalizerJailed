@@ -50,6 +50,20 @@
 #import <math.h>
 
 /*
+    ===== 修改说明 v11（2026-10-20）=====
+
+    面板从一行按钮扩成两行：
+        第一行：导出TXT / 复制全文 / 抓界面   （侦察用，保留）
+        第二行：秒过广告 / 自动:开|关 / 打标记 （v11 新增）
+
+    「秒过广告」→ 调 main.m 的 AdKillRun，按顺序试 6 种打法，4.6 秒后弹结果 toast。
+    「自动:开」→ 写 NSUserDefaults[ad_auto_kill]，main.m 里 1 秒巡检自动触发。
+                  开启后按钮变蓝，一眼能看出状态。
+
+    ===== 以下是 v10 的说明，保留备查 =====
+*/
+
+/*
     ===== 修改说明 v10（2026-10-20，侦察版）=====
 
     保活这条路在 iOS 27 上已证死（见 main.m 顶部说明），本版转为侦察。
@@ -78,6 +92,12 @@ extern NSString *ReconLatestFilePath(void);
 extern void ReconMark(NSString *label);
 extern void ReconSnapshotUIExternal(void);
 
+/* 由 main.m 提供：秒过接口（v11） */
+extern void AdKillRun(NSString *reason);
+extern NSString *AdKillSummary(void);
+extern BOOL AdAutoKillEnabled(void);
+extern void AdSetAutoKill(BOOL enabled);
+
 @interface FloatingButtonWindow ()
 @property (nonatomic, strong) UIButton *floatingButton;
 @property (nonatomic, strong) UIView *handleView;
@@ -94,6 +114,7 @@ extern void ReconSnapshotUIExternal(void);
 @property (nonatomic, assign) NSTimeInterval lastHeartbeat;
 @property (nonatomic, assign) NSTimeInterval suspendedGap;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
+@property (nonatomic, strong) UIButton *autoKillButton;
 @end
 
 static void vibrateDevice() {
@@ -453,13 +474,14 @@ static NSData *makeInaudibleWav(void) {
     if (self.logPanel == nil) {
         CGFloat w = self.bounds.size.width;
         CGFloat h = self.bounds.size.height;
-        CGFloat rowY = h - 96.0;
+        CGFloat row2Y = h - 96.0;
+        CGFloat row1Y = row2Y - 48.0;
 
         UIView *panel = [[UIView alloc] initWithFrame:self.bounds];
         panel.backgroundColor = [UIColor colorWithRed:0.02 green:0.02 blue:0.03 alpha:0.98];
         panel.userInteractionEnabled = YES;
 
-        UITextView *textView = [[UITextView alloc] initWithFrame:CGRectMake(10, 66, w - 20, rowY - 66 - 10)];
+        UITextView *textView = [[UITextView alloc] initWithFrame:CGRectMake(10, 66, w - 20, row1Y - 66 - 10)];
         textView.backgroundColor = [UIColor clearColor];
         textView.textColor = [UIColor whiteColor];
         textView.editable = NO;
@@ -469,7 +491,7 @@ static NSData *makeInaudibleWav(void) {
         textView.font = mono ?: [UIFont systemFontOfSize:10.0];
 
         UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w - 120, 34)];
-        titleLabel.text = @"AdRecon v10 侦察面板";
+        titleLabel.text = @"AdRecon v11 侦察 + 秒过";
         titleLabel.textColor = [UIColor whiteColor];
         titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
 
@@ -480,31 +502,25 @@ static NSData *makeInaudibleWav(void) {
         closeButton.titleLabel.font = [UIFont systemFontOfSize:15.0];
         [closeButton addTarget:self action:@selector(hideLogPanel) forControlEvents:UIControlEventTouchUpInside];
 
-        UIStackView *row = [[UIStackView alloc] initWithFrame:CGRectMake(10, rowY, w - 20, 42)];
-        row.axis = UILayoutConstraintAxisHorizontal;
-        row.distribution = UIStackViewDistributionFillEqually;
-        row.spacing = 8.0;
+        /* 第一行：侦察相关 */
+        UIStackView *row1 = [self buildButtonRowWithTitles:@[@"导出TXT", @"复制全文", @"抓界面"]
+                                                selectors:@[@"exportReportTapped", @"copyReportTapped", @"snapshotTapped"]
+                                                    frame:CGRectMake(10, row1Y, w - 20, 40)];
 
-        NSArray<NSString *> *titles = @[@"导出TXT", @"复制全文", @"打标记", @"抓界面"];
-        NSArray<NSString *> *selectorNames = @[@"exportReportTapped", @"copyReportTapped", @"markTapped", @"snapshotTapped"];
+        /* 第二行：秒过相关 */
+        UIStackView *row2 = [self buildButtonRowWithTitles:@[@"秒过广告", @"自动:关", @"打标记"]
+                                                selectors:@[@"adKillTapped", @"autoKillTapped", @"markTapped"]
+                                                    frame:CGRectMake(10, row2Y, w - 20, 40)];
 
-        for (NSUInteger i = 0; i < titles.count; i++) {
-            UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-            [button setTitle:titles[i] forState:UIControlStateNormal];
-            [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-            button.titleLabel.font = [UIFont systemFontOfSize:13.0];
-            button.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
-            button.layer.cornerRadius = 9.0;
-            [button addTarget:self
-                       action:NSSelectorFromString(selectorNames[i])
-             forControlEvents:UIControlEventTouchUpInside];
-            [row addArrangedSubview:button];
-        }
+        UIButton *autoButton = (UIButton *)row2.arrangedSubviews[1];
+        self.autoKillButton = autoButton;
+        [self refreshAutoKillButton];
 
         [panel addSubview:textView];
         [panel addSubview:titleLabel];
         [panel addSubview:closeButton];
-        [panel addSubview:row];
+        [panel addSubview:row1];
+        [panel addSubview:row2];
         [self.rootViewController.view addSubview:panel];
 
         self.logPanel = panel;
@@ -516,7 +532,61 @@ static NSData *makeInaudibleWav(void) {
     self.logPanel.hidden = NO;
 }
 
-#pragma mark - 侦察报告导出（v10）
+#pragma mark - 侦察报告导出 + 秒过（v11）
+
+- (UIStackView *)buildButtonRowWithTitles:(NSArray<NSString *> *)titles
+                                selectors:(NSArray<NSString *> *)selectorNames
+                                    frame:(CGRect)frame {
+    UIStackView *row = [[UIStackView alloc] initWithFrame:frame];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.distribution = UIStackViewDistributionFillEqually;
+    row.spacing = 8.0;
+
+    for (NSUInteger i = 0; i < titles.count && i < selectorNames.count; i++) {
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        [button setTitle:titles[i] forState:UIControlStateNormal];
+        [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        button.titleLabel.font = [UIFont systemFontOfSize:13.0];
+        button.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
+        button.layer.cornerRadius = 9.0;
+        [button addTarget:self
+                   action:NSSelectorFromString(selectorNames[i])
+         forControlEvents:UIControlEventTouchUpInside];
+        [row addArrangedSubview:button];
+    }
+    return row;
+}
+
+- (void)refreshAutoKillButton {
+    if (self.autoKillButton == nil) {
+        return;
+    }
+    BOOL on = AdAutoKillEnabled();
+    [self.autoKillButton setTitle:(on ? @"自动:开" : @"自动:关") forState:UIControlStateNormal];
+    self.autoKillButton.backgroundColor = on
+        ? [UIColor colorWithRed:0.16 green:0.42 blue:0.78 alpha:1.0]
+        : [UIColor colorWithWhite:0.22 alpha:1.0];
+}
+
+- (void)adKillTapped {
+    NSString *before = AdKillSummary();
+    AdKillRun(@"手动点秒过");
+    [self showSimpleToast:[NSString stringWithFormat:@"秒过中… 当前 %@", before]];
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf showSimpleToast:[NSString stringWithFormat:@"结果：%@", AdKillSummary()]];
+    });
+}
+
+- (void)autoKillTapped {
+    BOOL next = !AdAutoKillEnabled();
+    AdSetAutoKill(next);
+    [self refreshAutoKillButton];
+    [self showSimpleToast:next ? @"自动秒过已开启（检测到广告就自动过）" : @"自动秒过已关闭"];
+}
 
 - (void)showSimpleToast:(NSString *)text {
     NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"] ?: @"AdRecon";
@@ -626,22 +696,22 @@ static NSData *makeInaudibleWav(void) {
 
 - (NSString *)statusText {
     if (!self.isImmortalized) {
-        return @"v10 · 侦察中（长按导出）";
+        return @"v11 · 就绪（长按出面板）";
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v10 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v11 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v10 · 音频运行中";
+        return @"v11 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v10 · 音频未启动";
+        return @"v11 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v10 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v11 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）
