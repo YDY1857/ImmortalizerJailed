@@ -16,23 +16,21 @@
 */
 
 /*
-    ===== 修改说明 v6（2026-10）=====
+    ===== 修改说明 v7（2026-10）=====
 
-    v4 在 NSNotificationCenter 上拦截 willResignActive / didEnterBackground，
-    实测后果：拦截计数飙到 99，广告界面直接卡死 —— 把 App 的状态通知硬拦下来，
-    会让它的内部状态机卡在一个"永远转换不完"的中间态。这条路回滚，不再拦通知。
+    这一版的目标是"退回去 + 装眼睛"，不再盲改。
 
-    v6 = 回到作者原本的 scene hook 路线，只增加一条过滤：
-    iOS 27 上"失活"由 settings diff 里的 deactivationReasons 表达，
-    而原来的条件里只有 foreground = No，漏掉了它。补上，并记录拦截次数
-    （immortalizer_scene_drop_count），浮窗长按可看"场N"。
+    为什么退回：
+      v4 硬拦 willResignActive / didEnterBackground 通知 → 拦截计数飙到 99、界面卡死；
+      v5 / v6 加 deactivationReasons 过滤 → 从后台切回来直接闪退。
+      这正是作者 issue #7 记录过的 iOS 27 行为：过滤失活事件会导致进程终止。
 
-    修改点只有两处，其余保持作者原样：
-      1. scene hook 里加 deactivationReasons 分支 + 计数
-      2. applicationState 恒返回 Active（只对 UserNotifications / PushKit 如实返回）
+    所以 v7：
+      1. scene hook 恢复成作者的原始过滤条件，一个字不改；
+      2. 把每次进来的 settings diff 原文抓下来（最多 40 条），浮窗长按可以看到；
+      3. applicationState 恒返回 Active（仅推送相关调用方如实返回）。
 
-    如果"场N"在涨、倒计时仍然不动，那倒计时就是被渲染层掐的
-    （CADisplayLink 停止、视频不渲染、WKWebView 不可见），应用层 hook 到不了那里。
+    有了真机上的真实字符串，才能精准匹配，而不是继续猜 "foreground = No"。
 */
 
 #import <objc/runtime.h>
@@ -43,45 +41,65 @@
 
 static BOOL isImmortalized;
 
+#pragma mark - diff 日志（v7 新增）
+
+static NSMutableArray<NSString *> *gDiffLog = nil;
+
+static void rememberDiff(NSString *line) {
+    if (gDiffLog == nil) {
+        gDiffLog = [NSMutableArray array];
+    }
+    if (line.length == 0) {
+        line = @"(空)";
+    }
+    [gDiffLog addObject:line];
+    while (gDiffLog.count > 40) {
+        [gDiffLog removeObjectAtIndex:0];
+    }
+}
+
+/* 给浮窗调用：返回当前日志快照 */
+NSArray<NSString *> *ImmortalizerCopyDiffLog(void) {
+    if (gDiffLog == nil) {
+        return @[];
+    }
+    return [gDiffLog copy];
+}
+
 static void prefsChanged() {
     isImmortalized = [[NSUserDefaults standardUserDefaults] boolForKey:@"immortalized"];
 }
 
-#pragma mark - Scene 层拦截（原作者逻辑，保持不变）
+#pragma mark - Scene 层拦截（作者的原始逻辑，保持不变）
 
 static void (*original_sceneID_updateWithSettingsDiff_transitionContext_completion)(id, SEL, id, id, id, id);
 
 /* thanks to @khanhduytran0 for this wonderful hook. goat */
 void new_sceneID_updateWithSettingsDiff_transitionContext_completion(id self, SEL _cmd, id arg1, id arg2, id arg3, id arg4) {
+    NSString *diffDescription = [arg2 description];
+
     if (!isImmortalized) {
         return original_sceneID_updateWithSettingsDiff_transitionContext_completion(self, _cmd, arg1, arg2, arg3, arg4);
     }
 
-    NSString *diffDescription = [arg2 description];
-
-    /* v5：iOS 27 上"失活"不走前台标记，走 deactivationReasons。
-       广告 / 播放器会把它当成"App 被切走了"，据此暂停倒计时。这里一并吞掉。 */
-    if ([diffDescription containsString:@"deactivationReasons"]) {
-        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        NSInteger count = [defaults integerForKey:@"immortalizer_scene_drop_count"];
-        [defaults setInteger:count + 1 forKey:@"immortalizer_scene_drop_count"];
-        return;
-    }
+    BOOL shouldDrop = NO;
 
     if ([diffDescription containsString:@"foreground = NotSet"] || 
         [diffDescription containsString:@"foreground = No"] || 
         [diffDescription containsString:@"foreground = BSSettingFlagNo"] || 
         [diffDescription containsString:@"foreground = NO"]) { 
-        return;
+        shouldDrop = YES;
+    } else if ([diffDescription containsString:@"hostContextIdentifierForSnapshotting = 0"] || 
+               [diffDescription containsString:@"scenePresenterRenderIdentifierForSnapshotting = 0"] ||
+               [diffDescription containsString:@"targetOfEventDeferringEnvironments = (empty)"]) { 
+        shouldDrop = YES;
+    } else if ([diffDescription containsString:@"FBSceneSnapshotAction:"]) { 
+        shouldDrop = YES;
     }
 
-    if ([diffDescription containsString:@"hostContextIdentifierForSnapshotting = 0"] || 
-        [diffDescription containsString:@"scenePresenterRenderIdentifierForSnapshotting = 0"] ||
-        [diffDescription containsString:@"targetOfEventDeferringEnvironments = (empty)"]) { 
-        return;
-    }
-    
-    if ([diffDescription containsString:@"FBSceneSnapshotAction:"]) { 
+    rememberDiff([NSString stringWithFormat:@"%@ %@", shouldDrop ? @"DROP" : @"PASS", diffDescription ?: @"(null)"]);
+
+    if (shouldDrop) {
         return;
     }
 
@@ -119,7 +137,7 @@ static UIApplicationState hook_applicationState(id self, SEL _cmd) {
     return UIApplicationStateActive;
 }
 
-#pragma mark - 通知展示拦截（v3 原有逻辑，保留）
+#pragma mark - 通知展示拦截（作者逻辑，保留）
 
 static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions));
 static void hook_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions options)) {

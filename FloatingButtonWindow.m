@@ -49,6 +49,9 @@
 #import "FloatingButtonWindow.h"
 #import <math.h>
 
+/* 由 main.m 提供：返回最近 40 条 scene settings diff 原文 */
+extern NSArray<NSString *> *ImmortalizerCopyDiffLog(void);
+
 @interface FloatingButtonWindow ()
 @property (nonatomic, strong) UIButton *floatingButton;
 @property (nonatomic, strong) UIView *handleView;
@@ -57,6 +60,8 @@
 @property (nonatomic, strong) AVAudioPlayer *audioPlayer;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) NSTimer *dockTimer;
+@property (nonatomic, strong) UIView *logPanel;
+@property (nonatomic, strong) UITextView *logTextView;
 @property (nonatomic, assign) BOOL audioOK;
 @property (nonatomic, copy) NSString *audioLastError;
 @property (nonatomic, assign) BOOL suppressStateToast;
@@ -363,6 +368,10 @@ static NSData *makeInaudibleWav(void) {
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.logPanel != nil && !self.logPanel.hidden) {
+        return [super hitTest:point withEvent:event];
+    }
+
     CGPoint buttonPoint = [self convertPoint:point toView:self.floatingButton];
     if (!self.floatingButton.hidden && [self.floatingButton pointInside:buttonPoint withEvent:event]) {
         return [super hitTest:point withEvent:event];
@@ -398,7 +407,69 @@ static NSData *makeInaudibleWav(void) {
     }
     vibrateDevice();
     [self ensureAudioRunning];
-    [self showStatusToast];
+    [self showLogPanel];
+}
+
+- (NSString *)buildLogText {
+    NSMutableString *text = [NSMutableString string];
+    [text appendFormat:@"状态：%@\n", [self statusText]];
+    [text appendString:@"\n==== scene settings diff（最近 40 条）====\n\n"];
+
+    NSArray<NSString *> *logs = ImmortalizerCopyDiffLog();
+    if (logs.count == 0) {
+        [text appendString:@"(还没有抓到任何一条)\n"];
+    } else {
+        NSInteger index = logs.count;
+        for (NSString *line in [logs reverseObjectEnumerator]) {
+            [text appendFormat:@"[%ld] %@\n\n", (long)index--, line];
+        }
+    }
+
+    [text appendString:@"\n==== 操作说明 ====\n"];
+    [text appendString:@"DROP = 被插件吞掉的更新\nPASS = 正常交给系统的更新\n"];
+    [text appendString:@"切一次后台再回来，这里会出现新记录。\n"];
+    return text;
+}
+
+- (void)showLogPanel {
+    if (self.logPanel == nil) {
+        UIView *panel = [[UIView alloc] initWithFrame:self.bounds];
+        panel.backgroundColor = [UIColor colorWithRed:0.02 green:0.02 blue:0.03 alpha:0.98];
+        panel.userInteractionEnabled = YES;
+
+        UITextView *textView = [[UITextView alloc] initWithFrame:CGRectInset(self.bounds, 10, 70)];
+        textView.backgroundColor = [UIColor clearColor];
+        textView.textColor = [UIColor whiteColor];
+        textView.editable = NO;
+        textView.selectable = YES;
+        textView.alwaysBounceVertical = YES;
+        UIFont *mono = [UIFont fontWithName:@"Menlo" size:10.0];
+        textView.font = mono ?: [UIFont systemFontOfSize:10.0];
+
+        UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        closeButton.frame = CGRectMake(self.bounds.size.width - 96, 30, 80, 34);
+        [closeButton setTitle:@"关闭" forState:UIControlStateNormal];
+        [closeButton setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
+        closeButton.titleLabel.font = [UIFont systemFontOfSize:15.0];
+        [closeButton addTarget:self action:@selector(hideLogPanel) forControlEvents:UIControlEventTouchUpInside];
+
+        [panel addSubview:textView];
+        [panel addSubview:closeButton];
+        [self.rootViewController.view addSubview:panel];
+
+        self.logPanel = panel;
+        self.logTextView = textView;
+    }
+
+    self.logTextView.text = [self buildLogText];
+    self.logTextView.contentOffset = CGPointZero;
+    self.logPanel.hidden = NO;
+}
+
+- (void)hideLogPanel {
+    if (self.logPanel != nil) {
+        self.logPanel.hidden = YES;
+    }
 }
 
 - (void)updateButtonColor {
@@ -454,18 +525,18 @@ static NSData *makeInaudibleWav(void) {
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v6 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v7 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v6 · 音频运行中";
+        return @"v7 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v6 · 音频未启动";
+        return @"v7 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v6 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v7 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）
