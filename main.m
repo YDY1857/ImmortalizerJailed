@@ -16,17 +16,22 @@
 */
 
 /*
-    ===== 修改说明 v5（2026-10，针对"通知拦住了但倒计时仍冻结"）=====
+    ===== 修改说明 v6（2026-10）=====
 
-    v4 已经把 willResignActive / didEnterBackground 通知挡住了（计数器能到两位数），
-    但倒计时还是不动，说明广告 / 播放器看的不是通知，而是 scene 的失活状态。
+    v4 在 NSNotificationCenter 上拦截 willResignActive / didEnterBackground，
+    实测后果：拦截计数飙到 99，广告界面直接卡死 —— 把 App 的状态通知硬拦下来，
+    会让它的内部状态机卡在一个"永远转换不完"的中间态。这条路回滚，不再拦通知。
+
+    v6 = 回到作者原本的 scene hook 路线，只增加一条过滤：
     iOS 27 上"失活"由 settings diff 里的 deactivationReasons 表达，
-    而原来的过滤条件里只有 foreground = No，漏掉了这一条。
+    而原来的条件里只有 foreground = No，漏掉了它。补上，并记录拦截次数
+    （immortalizer_scene_drop_count），浮窗长按可看"场N"。
 
-    v5 在 scene hook 里补上 deactivationReasons 的过滤，并记录拦截次数
-    （immortalizer_scene_drop_count），浮窗长按可以看到。
+    修改点只有两处，其余保持作者原样：
+      1. scene hook 里加 deactivationReasons 分支 + 计数
+      2. applicationState 恒返回 Active（只对 UserNotifications / PushKit 如实返回）
 
-    如果这个次数在涨、倒计时仍然不动，那基本可以确定倒计时是被渲染层掐的
+    如果"场N"在涨、倒计时仍然不动，那倒计时就是被渲染层掐的
     （CADisplayLink 停止、视频不渲染、WKWebView 不可见），应用层 hook 到不了那里。
 */
 
@@ -81,54 +86,6 @@ void new_sceneID_updateWithSettingsDiff_transitionContext_completion(id self, SE
     }
 
     return original_sceneID_updateWithSettingsDiff_transitionContext_completion(self, _cmd, arg1, arg2, arg3, arg4);
-}
-
-#pragma mark - 通知层拦截（v4 新增）
-
-static NSArray *blockedNotificationNames(void) {
-    static NSArray *names = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        names = @[
-            UIApplicationWillResignActiveNotification,
-            UIApplicationDidEnterBackgroundNotification,
-            @"UIApplicationWillBeginSuspendingNotification",
-            @"UISceneWillDeactivateNotification",
-            @"UISceneDidEnterBackgroundNotification"
-        ];
-    });
-    return names;
-}
-
-static BOOL shouldSwallowNotification(NSString *name) {
-    if (!isImmortalized || name == nil) {
-        return NO;
-    }
-    if (![blockedNotificationNames() containsObject:name]) {
-        return NO;
-    }
-
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSInteger count = [defaults integerForKey:@"immortalizer_swallow_count"];
-    [defaults setInteger:count + 1 forKey:@"immortalizer_swallow_count"];
-
-    return YES;
-}
-
-static void (*orig_post_with_info)(id, SEL, NSString *, id, NSDictionary *);
-static void hook_post_with_info(id self, SEL _cmd, NSString *name, id object, NSDictionary *info) {
-    if (shouldSwallowNotification(name)) {
-        return;
-    }
-    orig_post_with_info(self, _cmd, name, object, info);
-}
-
-static void (*orig_post_basic)(id, SEL, NSString *, id);
-static void hook_post_basic(id self, SEL _cmd, NSString *name, id object) {
-    if (shouldSwallowNotification(name)) {
-        return;
-    }
-    orig_post_basic(self, _cmd, name, object);
 }
 
 #pragma mark - 状态查询拦截
@@ -204,22 +161,7 @@ static void setup() {
             method_setImplementation(originalMethod, (IMP)new_sceneID_updateWithSettingsDiff_transitionContext_completion);
         }
 
-        // 2. 通知投递过滤（v4）
-        Class centerClass = objc_getClass("NSNotificationCenter");
-        if (centerClass) {
-            Method withInfo = class_getInstanceMethod(centerClass, @selector(postNotificationName:object:userInfo:));
-            if (withInfo) {
-                orig_post_with_info = (void (*)(id, SEL, NSString *, id, NSDictionary *))method_getImplementation(withInfo);
-                method_setImplementation(withInfo, (IMP)hook_post_with_info);
-            }
-            Method basic = class_getInstanceMethod(centerClass, @selector(postNotificationName:object:));
-            if (basic) {
-                orig_post_basic = (void (*)(id, SEL, NSString *, id))method_getImplementation(basic);
-                method_setImplementation(basic, (IMP)hook_post_basic);
-            }
-        }
-
-        // 3. Application State Hook
+        // 2. Application State Hook
         Class uiAppClass = objc_getClass("UIApplication");
         Method appStateMethod = class_getInstanceMethod(uiAppClass, @selector(applicationState));
         if (appStateMethod) {
@@ -227,7 +169,7 @@ static void setup() {
             method_setImplementation(appStateMethod, (IMP)hook_applicationState);
         }
 
-        // 4. Notification Delegate Hook
+        // 3. Notification Delegate Hook
         Class unCenterClass = objc_getClass("UNUserNotificationCenter");
         Method setDelegateMethod = class_getInstanceMethod(unCenterClass, @selector(setDelegate:));
         if (setDelegateMethod) {
@@ -235,7 +177,7 @@ static void setup() {
             method_setImplementation(setDelegateMethod, (IMP)hook_setDelegate);
         }
 
-        // 5. 监听保活开关
+        // 4. 监听保活开关
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, (CFNotificationCallback)prefsChanged, CFSTR("com.sergy.immortalizerjailed.updateprefs"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
         [[FloatingButtonWindow sharedInstance] showButton];
