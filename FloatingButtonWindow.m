@@ -16,7 +16,7 @@
 */
 
 /*
-    ===== 修改说明 v6（2026-10，针对 iOS 27 保活失效）=====
+    ===== 修改说明 v8（2026-10，针对 iOS 27 保活失效）=====
 
     改动只发生在「音频保活」这一段，界面 / 拖拽 / 停靠逻辑保持原样。
 
@@ -525,18 +525,18 @@ static NSData *makeInaudibleWav(void) {
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v7 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v8 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v7 · 音频运行中";
+        return @"v8 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v7 · 音频未启动";
+        return @"v8 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v7 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v8 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）

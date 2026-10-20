@@ -16,21 +16,21 @@
 */
 
 /*
-    ===== 修改说明 v7（2026-10）=====
+    ===== 修改说明 v8（2026-10）=====
 
-    这一版的目标是"退回去 + 装眼睛"，不再盲改。
+    真机抓日志找到了根因：作者写的匹配字符串在自己的过滤条件里从来没命中过。
 
-    为什么退回：
-      v4 硬拦 willResignActive / didEnterBackground 通知 → 拦截计数飙到 99、界面卡死；
-      v5 / v6 加 deactivationReasons 过滤 → 从后台切回来直接闪退。
-      这正是作者 issue #7 记录过的 iOS 27 行为：过滤失活事件会导致进程终止。
+    iOS 27 把这个 settings diff 的 description 格式改了：
+        作者找 "foreground = No"
+        实际是 "foreground [obj] = 0"        （foreground 被拆成 [flag] / [obj] 两个键）
+    加上一条都拦不住，hook 等于原样转发，保活自然失效。
+    这也能解释"用两天后突然失效"——那两天系统还是旧格式，一次小版本更新改掉了。
 
-    所以 v7：
-      1. scene hook 恢复成作者的原始过滤条件，一个字不改；
-      2. 把每次进来的 settings diff 原文抓下来（最多 40 条），浮窗长按可以看到；
-      3. applicationState 恒返回 Active（仅推送相关调用方如实返回）。
-
-    有了真机上的真实字符串，才能精准匹配，而不是继续猜 "foreground = No"。
+    v8 做的事：
+      1. 按真机实测格式重写匹配规则（新格式 + 旧格式都兼容）；
+      2. deactivationReasons 只在被设成具体原因时吞掉，清空的那条必须放行，
+         否则 App 会永远卡在失活态，就是 issue #7 的闪退；
+      3. 日志只记录被拦的、以及带 foreground / deactivationReasons 字样的记录。
 */
 
 #import <objc/runtime.h>
@@ -41,7 +41,7 @@
 
 static BOOL isImmortalized;
 
-#pragma mark - diff 日志（v7 新增）
+#pragma mark - diff 日志
 
 static NSMutableArray<NSString *> *gDiffLog = nil;
 
@@ -74,6 +74,50 @@ static void prefsChanged() {
 
 static void (*original_sceneID_updateWithSettingsDiff_transitionContext_completion)(id, SEL, id, id, id, id);
 
+/* 返回非 nil 表示这条更新要被吞掉，字符串顺便当日志里的原因 */
+static NSString *dropReasonForDiff(NSString *diff) {
+    if (diff.length == 0) {
+        return nil;
+    }
+
+    /* iOS 27 新格式：foreground 拆成 flag / obj 两个键 */
+    if ([diff containsString:@"foreground [obj] = 0"] ||
+        [diff containsString:@"foreground [flag] = No"] ||
+        [diff containsString:@"foreground [obj] = No"]) {
+        return @"foreground";
+    }
+
+    /* iOS 14 ~ 26 旧格式，保留兼容 */
+    if ([diff containsString:@"foreground = NotSet"] ||
+        [diff containsString:@"foreground = No"] ||
+        [diff containsString:@"foreground = BSSettingFlagNo"] ||
+        [diff containsString:@"foreground = NO"]) {
+        return @"foreground-legacy";
+    }
+
+    /*
+        失活：deactivationReasons 被设成具体原因（systemGesture / systemAnimation）。
+        清空时是 "deactivationReasons = ;"，这一条必须放行 ——
+        全吞掉会让 App 永远卡在失活态，也就是 issue #7 那个闪退。
+    */
+    if ([diff containsString:@"deactivationReasons"] &&
+        ![diff containsString:@"deactivationReasons = ;"]) {
+        return @"deactivate";
+    }
+
+    if ([diff containsString:@"hostContextIdentifierForSnapshotting = 0"] ||
+        [diff containsString:@"scenePresenterRenderIdentifierForSnapshotting = 0"] ||
+        [diff containsString:@"targetOfEventDeferringEnvironments = (empty)"]) {
+        return @"snapshotting";
+    }
+
+    if ([diff containsString:@"FBSceneSnapshotAction:"]) {
+        return @"snapshot-action";
+    }
+
+    return nil;
+}
+
 /* thanks to @khanhduytran0 for this wonderful hook. goat */
 void new_sceneID_updateWithSettingsDiff_transitionContext_completion(id self, SEL _cmd, id arg1, id arg2, id arg3, id arg4) {
     NSString *diffDescription = [arg2 description];
@@ -82,22 +126,35 @@ void new_sceneID_updateWithSettingsDiff_transitionContext_completion(id self, SE
         return original_sceneID_updateWithSettingsDiff_transitionContext_completion(self, _cmd, arg1, arg2, arg3, arg4);
     }
 
-    BOOL shouldDrop = NO;
+    /*
+        v8：把匹配规则改成真机实测到的格式。
 
-    if ([diffDescription containsString:@"foreground = NotSet"] || 
-        [diffDescription containsString:@"foreground = No"] || 
-        [diffDescription containsString:@"foreground = BSSettingFlagNo"] || 
-        [diffDescription containsString:@"foreground = NO"]) { 
-        shouldDrop = YES;
-    } else if ([diffDescription containsString:@"hostContextIdentifierForSnapshotting = 0"] || 
-               [diffDescription containsString:@"scenePresenterRenderIdentifierForSnapshotting = 0"] ||
-               [diffDescription containsString:@"targetOfEventDeferringEnvironments = (empty)"]) { 
-        shouldDrop = YES;
-    } else if ([diffDescription containsString:@"FBSceneSnapshotAction:"]) { 
-        shouldDrop = YES;
+        iOS 27 上这个 description 变成了：
+            foreground [flag] = NotSet;
+            foreground [obj]  = 0;          ← 0 就是"即将进后台"
+            deactivationReasons = systemGesture;   ← 被切走的原因
+            deactivationReasons = ;                ← 清空（回到前台时要放行）
+
+        作者原来的 "foreground = No" 在新格式里根本不存在，所以一条都拦不住。
+    */
+    NSString *reason = dropReasonForDiff(diffDescription);
+    BOOL shouldDrop = (reason != nil);
+
+    /*
+        日志只留有用的：被拦的，以及带 foreground / deactivationReasons /
+        snapshotting 字样的。不然满屏都是屏幕亮度变化，把关键记录挤掉。
+    */
+    BOOL worthLogging = shouldDrop ||
+                        [diffDescription containsString:@"foreground"] ||
+                        [diffDescription containsString:@"deactivationReasons"] ||
+                        [diffDescription containsString:@"Snapshotting"];
+
+    if (worthLogging) {
+        rememberDiff([NSString stringWithFormat:@"%@%@ %@",
+                      shouldDrop ? @"DROP" : @"PASS",
+                      reason ? [NSString stringWithFormat:@"(%@)", reason] : @"",
+                      diffDescription ?: @"(null)"]);
     }
-
-    rememberDiff([NSString stringWithFormat:@"%@ %@", shouldDrop ? @"DROP" : @"PASS", diffDescription ?: @"(null)"]);
 
     if (shouldDrop) {
         return;
