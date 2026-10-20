@@ -49,8 +49,34 @@
 #import "FloatingButtonWindow.h"
 #import <math.h>
 
+/*
+    ===== 修改说明 v10（2026-10-20，侦察版）=====
+
+    保活这条路在 iOS 27 上已证死（见 main.m 顶部说明），本版转为侦察。
+
+    改动点：
+    1. 长按浮窗不再启动音频（侦察版不需要保活，留着只会污染日志）
+    2. 诊断面板改成显示完整侦察报告（前 6 万字），不再是 scene diff 单页
+    3. 面板底部加 4 个按钮：导出TXT / 复制全文 / 打标记 / 抓界面
+       - 导出TXT  → 生成沙盒 txt 文件，弹系统分享面板（可存到"文件"、发微信）
+       - 复制全文 → 整个报告进剪贴板（导出失败时的兜底）
+       - 打标记   → 在时间线上插一条醒目横幅，方便对齐"广告出现的时刻"
+       - 抓界面   → 立刻抓一次 keyWindow 递归视图树
+    4. toast 前缀 v9 → v10（必须能一眼确认装的是哪一版）
+
+    与 main.m 的接口：ReconReportText / ReconWriteReportFile / ReconMark /
+    ReconSnapshotUIExternal / ReconLatestFilePath
+*/
+
 /* 由 main.m 提供：返回最近 40 条 scene settings diff 原文 */
 extern NSArray<NSString *> *ImmortalizerCopyDiffLog(void);
+
+/* 由 main.m 提供：侦察报告接口 */
+extern NSString *ReconReportText(void);
+extern NSString *ReconWriteReportFile(void);
+extern NSString *ReconLatestFilePath(void);
+extern void ReconMark(NSString *label);
+extern void ReconSnapshotUIExternal(void);
 
 @interface FloatingButtonWindow ()
 @property (nonatomic, strong) UIButton *floatingButton;
@@ -406,38 +432,34 @@ static NSData *makeInaudibleWav(void) {
         return;
     }
     vibrateDevice();
-    [self ensureAudioRunning];
+    /* v10：不再启动音频。侦察版纯采集，保活那套已无价值且会污染日志。 */
     [self showLogPanel];
 }
 
 - (NSString *)buildLogText {
-    NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"状态：%@\n", [self statusText]];
-    [text appendString:@"\n==== scene settings diff（最近 40 条）====\n\n"];
-
-    NSArray<NSString *> *logs = ImmortalizerCopyDiffLog();
-    if (logs.count == 0) {
-        [text appendString:@"(还没有抓到任何一条)\n"];
-    } else {
-        NSInteger index = logs.count;
-        for (NSString *line in [logs reverseObjectEnumerator]) {
-            [text appendFormat:@"[%ld] %@\n\n", (long)index--, line];
-        }
+    NSString *full = ReconReportText();
+    if (full.length == 0) {
+        return @"侦察报告为空（插件可能没加载成功）";
     }
-
-    [text appendString:@"\n==== 操作说明 ====\n"];
-    [text appendString:@"DROP = 被插件吞掉的更新\nPASS = 正常交给系统的更新\n"];
-    [text appendString:@"切一次后台再回来，这里会出现新记录。\n"];
-    return text;
+    /* 面板只渲染前 6 万字，避免 UITextView 卡死；完整内容走导出 */
+    if (full.length > 60000) {
+        return [[full substringToIndex:60000]
+                stringByAppendingString:@"\n\n…（面板只显示前 6 万字，完整内容请点「导出TXT」）"];
+    }
+    return full;
 }
 
 - (void)showLogPanel {
     if (self.logPanel == nil) {
+        CGFloat w = self.bounds.size.width;
+        CGFloat h = self.bounds.size.height;
+        CGFloat rowY = h - 96.0;
+
         UIView *panel = [[UIView alloc] initWithFrame:self.bounds];
         panel.backgroundColor = [UIColor colorWithRed:0.02 green:0.02 blue:0.03 alpha:0.98];
         panel.userInteractionEnabled = YES;
 
-        UITextView *textView = [[UITextView alloc] initWithFrame:CGRectInset(self.bounds, 10, 70)];
+        UITextView *textView = [[UITextView alloc] initWithFrame:CGRectMake(10, 66, w - 20, rowY - 66 - 10)];
         textView.backgroundColor = [UIColor clearColor];
         textView.textColor = [UIColor whiteColor];
         textView.editable = NO;
@@ -446,15 +468,43 @@ static NSData *makeInaudibleWav(void) {
         UIFont *mono = [UIFont fontWithName:@"Menlo" size:10.0];
         textView.font = mono ?: [UIFont systemFontOfSize:10.0];
 
+        UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w - 120, 34)];
+        titleLabel.text = @"AdRecon v10 侦察面板";
+        titleLabel.textColor = [UIColor whiteColor];
+        titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
+
         UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        closeButton.frame = CGRectMake(self.bounds.size.width - 96, 30, 80, 34);
+        closeButton.frame = CGRectMake(w - 96, 30, 80, 34);
         [closeButton setTitle:@"关闭" forState:UIControlStateNormal];
         [closeButton setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
         closeButton.titleLabel.font = [UIFont systemFontOfSize:15.0];
         [closeButton addTarget:self action:@selector(hideLogPanel) forControlEvents:UIControlEventTouchUpInside];
 
+        UIStackView *row = [[UIStackView alloc] initWithFrame:CGRectMake(10, rowY, w - 20, 42)];
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.distribution = UIStackViewDistributionFillEqually;
+        row.spacing = 8.0;
+
+        NSArray<NSString *> *titles = @[@"导出TXT", @"复制全文", @"打标记", @"抓界面"];
+        NSArray<NSString *> *selectorNames = @[@"exportReportTapped", @"copyReportTapped", @"markTapped", @"snapshotTapped"];
+
+        for (NSUInteger i = 0; i < titles.count; i++) {
+            UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+            [button setTitle:titles[i] forState:UIControlStateNormal];
+            [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            button.titleLabel.font = [UIFont systemFontOfSize:13.0];
+            button.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
+            button.layer.cornerRadius = 9.0;
+            [button addTarget:self
+                       action:NSSelectorFromString(selectorNames[i])
+             forControlEvents:UIControlEventTouchUpInside];
+            [row addArrangedSubview:button];
+        }
+
         [panel addSubview:textView];
+        [panel addSubview:titleLabel];
         [panel addSubview:closeButton];
+        [panel addSubview:row];
         [self.rootViewController.view addSubview:panel];
 
         self.logPanel = panel;
@@ -464,6 +514,61 @@ static NSData *makeInaudibleWav(void) {
     self.logTextView.text = [self buildLogText];
     self.logTextView.contentOffset = CGPointZero;
     self.logPanel.hidden = NO;
+}
+
+#pragma mark - 侦察报告导出（v10）
+
+- (void)showSimpleToast:(NSString *)text {
+    NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"] ?: @"AdRecon";
+    CustomToastView *toastView = [[CustomToastView alloc] initWithTitle:appName
+                                                              subtitle:text
+                                                                  icon:[UIImage systemImageNamed:@"doc.text.fill"]
+                                                              autoHide:4];
+    [toastView presentToastInViewController:self.rootViewController];
+}
+
+- (void)exportReportTapped {
+    NSString *path = ReconWriteReportFile();
+
+    if (path.length == 0) {
+        UIPasteboard.generalPasteboard.string = ReconReportText() ?: @"";
+        [self showSimpleToast:@"写文件失败，已复制到剪贴板"];
+        return;
+    }
+
+    NSURL *fileURL = [NSURL fileURLWithPath:path];
+    UIActivityViewController *activity =
+        [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
+
+    UIPopoverPresentationController *popover = activity.popoverPresentationController;
+    if (popover != nil) {
+        popover.sourceView = self.logPanel ?: self.rootViewController.view;
+        popover.sourceRect = CGRectMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds), 1.0, 1.0);
+    }
+
+    UIViewController *host = self.rootViewController;
+    if (host.presentedViewController != nil) {
+        host = host.presentedViewController;
+    }
+    [host presentViewController:activity animated:YES completion:nil];
+
+    [self showSimpleToast:[NSString stringWithFormat:@"已生成 %@", path.lastPathComponent]];
+}
+
+- (void)copyReportTapped {
+    NSString *text = ReconReportText() ?: @"";
+    UIPasteboard.generalPasteboard.string = text;
+    [self showSimpleToast:[NSString stringWithFormat:@"已复制 %lu 字到剪贴板", (unsigned long)text.length]];
+}
+
+- (void)markTapped {
+    ReconMark(@"用户按了打标记 —— 这一时刻大概就是广告出现 / 卡住的时刻");
+    [self showSimpleToast:@"已在时间线插入标记"];
+}
+
+- (void)snapshotTapped {
+    ReconSnapshotUIExternal();
+    [self showSimpleToast:@"已抓取当前界面树"];
 }
 
 - (void)hideLogPanel {
@@ -521,22 +626,22 @@ static NSData *makeInaudibleWav(void) {
 
 - (NSString *)statusText {
     if (!self.isImmortalized) {
-        return @"At Rest";
+        return @"v10 · 侦察中（长按导出）";
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v9 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v10 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v9 · 音频运行中";
+        return @"v10 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v9 · 音频未启动";
+        return @"v10 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v9 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v10 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）
