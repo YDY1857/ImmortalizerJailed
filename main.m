@@ -16,6 +16,47 @@
 */
 
 /*
+    ===== 修改说明 v11（2026-10-20）从"侦察"转"秒过" =====
+
+    【v10 真机报告推翻了之前的全部假设】
+    报告显示：
+      1. 广告载体不是 AVPlayer，是支付宝自研的 BeeVideoPlayerView / MFCorePlayerView
+         （所以 v3~v9 hook AVPlayer 一条都没命中）
+      2. 命中的 15 秒 NSTimer 是 DTRpcOperation 的 RPC 超时，跟广告无关
+         —— 15 秒不是 NSTimer 跑的
+      3. 没有任何第三方广告 SDK（穿山甲/优量汇/快手全部零命中）
+         —— 是支付宝自研广告体系
+      4. 倒计时冻结的根本原因：不是 scene 事件，是广告自身的计时/播放被 App 主动暂停
+         （AdRewardView 里有 pasueTimer: / resumeTimer:，进后台就调 pause）
+
+    结论：v3~v9 方向从一开始就错了。吞 scene 事件对"视频/计时被暂停"毫无作用，
+    只会让 App 状态错乱然后被系统杀掉。保活这条路正式关闭。
+
+    【v11 做法：直接让广告"瞬间走完"】
+    用 class-dump 解了 373MB 主二进制（AlipayWallet 12.12.30），拿到确定的方法签名：
+        AdOpenScreenView    -exitAd                     零参数
+        AdOpenScreenView    -exiAdWhenTimeOver          零参数
+        CountdownButton     -setRemainingTime:(double)
+        CountdownButton     -updateCountdown            零参数
+        AdRewardView        -countDownFinish            零参数
+        AdRewardedVideoView -countDownEnd               零参数
+        BeeVideoPlayerView  -seekToTime:(double)
+        BeeVideoPlayerView  -getCurrentTime  -> double
+    全部从 __objc_methtype 核对过参数类型，直接 objc_msgSend 调用是安全的。
+
+    点「秒过广告」后，按顺序自动尝试 6 种打法，每步 0.6 秒，一旦广告从视图树消失
+    就跳过后续步骤。全程记录哪一步生效，报告里能查。
+
+    【安全设计】
+    - 每一步执行前都从视图树重新找"活着的"实例，广告关了就不会碰已释放的对象
+    - 自动模式只认 AdOpenScreenView / AdRewardView / AdRewardedVideoView 三类，
+      不认 CountdownButton（支付/转账页也有倒计时，误杀风险太高）
+    - 自动模式默认关闭，需要手动打开
+
+    ===== 以下是 v10 的原始说明，保留备查 =====
+*/
+
+/*
     ===== 修改说明 v10（2026-10-20，侦察版 / 方案 B 第一步）=====
 
     【为什么改】
@@ -211,7 +252,7 @@ static void reconCollectEnv(void) {
     }
 
     @synchronized (gEnvLines) {
-        [gEnvLines addObject:@"扫描器        : AdRecon v10（侦察版，不是保活版）"];
+        [gEnvLines addObject:@"扫描器        : AdRecon v11（侦察 + 秒过）"];
         [gEnvLines addObject:[NSString stringWithFormat:@"采集开始      : %@", [NSDate date]]];
         [gEnvLines addObject:[NSString stringWithFormat:@"iOS 版本      : %@", device.systemVersion]];
         [gEnvLines addObject:[NSString stringWithFormat:@"设备型号      : %@", reconSysctlString(@"hw.machine") ?: @"?"]];
@@ -1292,7 +1333,7 @@ static NSString *reconReportTextInternal(void) {
     NSMutableString *out = [NSMutableString string];
 
     [out appendString:@"================================================================\n"];
-    [out appendString:@"   支付宝 15 秒广告 · 侦察报告（AdRecon v10）\n"];
+    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v11）\n"];
     [out appendString:@"   由注入版 dylib 自动生成，直接把这个文件发给元宝\n"];
     [out appendString:@"================================================================\n\n"];
 
@@ -1382,9 +1423,19 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"        Swift 内部符号、服务端下发的动态脚本。\n"];
     [out appendString:@"如果报告里一片空白，说明广告全在这些层面，需要换侦察手段。\n\n"];
 
-    [out appendString:@"【六、生成信息】\n"];
+    [out appendString:@"【六、秒过能力（v11）】\n"];
+    [out appendString:@"静态分析自 AlipayWallet 12.12.30 的 __objc_methtype，签名已核对：\n"];
+    [out appendString:@"  AdOpenScreenView    -exitAd / -exiAdWhenTimeOver   零参数\n"];
+    [out appendString:@"  CountdownButton     -setRemainingTime:(double) + -updateCountdown\n"];
+    [out appendString:@"  AdRewardView        -countDownFinish               零参数\n"];
+    [out appendString:@"  AdRewardedVideoView -countDownEnd                  零参数\n"];
+    [out appendString:@"  BeeVideoPlayerView  -seekToTime:(double) / -getCurrentTime\n"];
+    [out appendString:@"执行顺序：倒计时归零 → 视频快进 → 激励结束 → 激励视频结束 → 开屏时间到 → 开屏退出\n"];
+    [out appendString:@"每步间隔 0.6 秒，广告一消失就跳过后续步骤。日志里搜 [KILL] 能看到过程。\n\n"];
+
+    [out appendString:@"【七、生成信息】\n"];
     [out appendFormat:@"生成时间: %@\n", [NSDate date]];
-    [out appendFormat:@"插件版本: AdRecon v10\n"];
+    [out appendFormat:@"插件版本: AdRecon v11\n"];
     [out appendFormat:@"设备    : %@ / iOS %@\n",
      reconSysctlString(@"hw.machine") ?: @"?",
      [[UIDevice currentDevice] systemVersion]];
@@ -1415,7 +1466,7 @@ NSString *ReconWriteReportFile(void) {
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [formatter stringFromDate:[NSDate date]];
-    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v10-%@.txt", stamp];
+    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v11-%@.txt", stamp];
     NSString *path = [dir stringByAppendingPathComponent:fileName];
 
     NSError *error = nil;
@@ -1471,6 +1522,282 @@ NSInteger ReconLineCount(void) {
     }
 }
 
+#pragma mark - 广告秒过（v11 新增）
+/*
+    静态分析依据（class-dump AlipayWallet 12.12.30，__objc_methtype 已核对类型）：
+        AdOpenScreenView     -exitAd                        v16@0:8
+        AdOpenScreenView     -exiAdWhenTimeOver             v16@0:8
+        AdOpenScreenView     -countdownBoutton              @16@0:8
+        CountdownButton      -setRemainingTime:             v24@0:8d16
+        CountdownButton      -updateCountdown               v16@0:8
+        CountdownButton      -cancelCountdown               v16@0:8
+        AdRewardView         -countDownFinish               v16@0:8
+        AdRewardView         -didCloseView                  v16@0:8
+        AdRewardedVideoView  -countDownEnd                  v16@0:8
+        AdRewardedVideoView  -closeView                     v16@0:8
+        BeeVideoPlayerView   -seekToTime:                   v24@0:8d16
+        BeeVideoPlayerView   -getCurrentTime                d16@0:8
+*/
+
+static BOOL gAdKillRunning = NO;
+static NSTimeInterval gLastAutoKill = 0;
+static int gAutoKillCount = 0;
+
+static void adCollectViews(UIView *root, Class cls, NSMutableArray *out, int depth) {
+    if (root == nil || out == nil || depth > 40) {
+        return;
+    }
+    if ([root isKindOfClass:cls]) {
+        [out addObject:root];
+    }
+    for (UIView *sub in root.subviews) {
+        adCollectViews(sub, cls, out, depth + 1);
+    }
+}
+
+/* 从当前所有窗口的视图树里找存活实例（拿到的都是强引用，调用期间不会被释放） */
+static NSArray *adFindViews(NSString *className) {
+    Class cls = NSClassFromString(className);
+    if (cls == NULL) {
+        return @[];
+    }
+    NSMutableArray *out = [NSMutableArray array];
+    for (UIWindow *win in reconAllWindows()) {
+        adCollectViews(win, cls, out, 0);
+    }
+    return out;
+}
+
+static NSInteger adCount(NSString *className) {
+    return (NSInteger)adFindViews(className).count;
+}
+
+static BOOL adCall(id target, NSString *selName) {
+    if (target == nil) {
+        return NO;
+    }
+    SEL sel = NSSelectorFromString(selName);
+    if (![target respondsToSelector:sel]) {
+        return NO;
+    }
+    ((void (*)(id, SEL))objc_msgSend)(target, sel);
+    return YES;
+}
+
+static BOOL adCallD(id target, NSString *selName, double value) {
+    if (target == nil) {
+        return NO;
+    }
+    SEL sel = NSSelectorFromString(selName);
+    if (![target respondsToSelector:sel]) {
+        return NO;
+    }
+    ((void (*)(id, SEL, double))objc_msgSend)(target, sel, value);
+    return YES;
+}
+
+static double adCallRetD(id target, NSString *selName) {
+    if (target == nil) {
+        return 0;
+    }
+    SEL sel = NSSelectorFromString(selName);
+    if (![target respondsToSelector:sel]) {
+        return 0;
+    }
+    return ((double (*)(id, SEL))objc_msgSend)(target, sel);
+}
+
+static NSString *adSnapshotState(void) {
+    static NSArray<NSString *> *names = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        names = @[@"AdOpenScreenView", @"AdRewardView", @"AdRewardedVideoView",
+                  @"AdInterstitialView", @"CDPHugeAdView", @"AdBannerView",
+                  @"CountdownButton", @"BeeVideoPlayerView"];
+    });
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSString *name in names) {
+        NSInteger count = adCount(name);
+        if (count > 0) {
+            [parts addObject:[NSString stringWithFormat:@"%@×%ld", name, (long)count]];
+        }
+    }
+    return parts.count > 0 ? [parts componentsJoinedByString:@", "] : @"(屏上已无广告视图)";
+}
+
+/* 自动模式只认这三个类，绝不碰 CountdownButton（支付页也有倒计时） */
+static BOOL adAdPresent(void) {
+    return adCount(@"AdOpenScreenView") > 0 ||
+           adCount(@"AdRewardView") > 0 ||
+           adCount(@"AdRewardedVideoView") > 0;
+}
+
+static void adPerformStep(NSString *step) {
+    @try {
+        if ([step isEqualToString:@"countdown-zero"]) {
+            NSArray *buttons = adFindViews(@"CountdownButton");
+            if (buttons.count == 0) {
+                reconLogF(@"[KILL] ①倒计时归零：屏上没有 CountdownButton，跳过");
+                return;
+            }
+            for (id button in buttons) {
+                BOOL set = adCallD(button, @"setRemainingTime:", 0.0);
+                BOOL upd = adCall(button, @"updateCountdown");
+                reconLogF(@"[KILL] ①倒计时归零 set=%@ update=%@", set ? @"OK" : @"NO", upd ? @"OK" : @"NO");
+            }
+            return;
+        }
+
+        if ([step isEqualToString:@"video-seek-end"]) {
+            NSArray *players = adFindViews(@"BeeVideoPlayerView");
+            if (players.count == 0) {
+                reconLogF(@"[KILL] ②视频快进：屏上没有 BeeVideoPlayerView，跳过");
+                return;
+            }
+            for (id player in players) {
+                double now = adCallRetD(player, @"getCurrentTime");
+                BOOL ok = adCallD(player, @"seekToTime:", now + 600.0);
+                reconLogF(@"[KILL] ②视频快进 当前位置=%.1fs → seek=%@", now, ok ? @"OK" : @"NO");
+            }
+            return;
+        }
+
+        if ([step isEqualToString:@"reward-finish"]) {
+            NSArray *views = adFindViews(@"AdRewardView");
+            if (views.count == 0) {
+                reconLogF(@"[KILL] ③激励倒计时结束：屏上没有 AdRewardView，跳过");
+                return;
+            }
+            for (id view in views) {
+                BOOL ok = adCall(view, @"countDownFinish");
+                reconLogF(@"[KILL] ③激励倒计时结束 countDownFinish=%@", ok ? @"OK" : @"NO");
+            }
+            return;
+        }
+
+        if ([step isEqualToString:@"rewardvideo-end"]) {
+            NSArray *views = adFindViews(@"AdRewardedVideoView");
+            if (views.count == 0) {
+                reconLogF(@"[KILL] ④激励视频结束：屏上没有 AdRewardedVideoView，跳过");
+                return;
+            }
+            for (id view in views) {
+                BOOL end = adCall(view, @"countDownEnd");
+                reconLogF(@"[KILL] ④激励视频结束 countDownEnd=%@", end ? @"OK" : @"NO");
+            }
+            return;
+        }
+
+        if ([step isEqualToString:@"openscreen-timeover"]) {
+            NSArray *views = adFindViews(@"AdOpenScreenView");
+            if (views.count == 0) {
+                reconLogF(@"[KILL] ⑤开屏时间到：屏上没有 AdOpenScreenView，跳过");
+                return;
+            }
+            for (id view in views) {
+                BOOL ok = adCall(view, @"exiAdWhenTimeOver");
+                reconLogF(@"[KILL] ⑤开屏时间到 exiAdWhenTimeOver=%@", ok ? @"OK" : @"NO");
+            }
+            return;
+        }
+
+        if ([step isEqualToString:@"openscreen-exit"]) {
+            NSArray *views = adFindViews(@"AdOpenScreenView");
+            if (views.count == 0) {
+                reconLogF(@"[KILL] ⑥开屏强制退出：屏上没有 AdOpenScreenView，跳过");
+                return;
+            }
+            for (id view in views) {
+                BOOL exit1 = adCall(view, @"exitAd");
+                reconLogF(@"[KILL] ⑥开屏强制退出 exitAd=%@", exit1 ? @"OK" : @"NO");
+            }
+            return;
+        }
+    } @catch (NSException *e) {
+        reconLogF(@"[KILL] 步骤 %@ 异常：%@", step, e.reason ?: @"?");
+    }
+}
+
+void AdKillRun(NSString *reason) {
+    if (![NSThread isMainThread]) {
+        NSString *copied = [reason copy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AdKillRun(copied);
+        });
+        return;
+    }
+
+    if (gAdKillRunning) {
+        reconLogF(@"[KILL] 上一轮还在跑，忽略这次（%@）", reason ?: @"?");
+        return;
+    }
+    gAdKillRunning = YES;
+
+    reconBanner([NSString stringWithFormat:@"秒过广告（%@）", reason ?: @"手动"]);
+    reconLogF(@"[KILL] 执行前：%@", adSnapshotState());
+
+    if (!adAdPresent() && adCount(@"CountdownButton") == 0) {
+        reconLogF(@"[KILL] 屏上没找到任何广告视图，这次不执行");
+        gAdKillRunning = NO;
+        return;
+    }
+
+    NSArray<NSString *> *steps = @[@"countdown-zero", @"video-seek-end", @"reward-finish",
+                                   @"rewardvideo-end", @"openscreen-timeover", @"openscreen-exit"];
+    double delay = 0.0;
+    for (NSString *step in steps) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            adPerformStep(step);
+        });
+        delay += 0.6;
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((delay + 0.6) * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        reconLogF(@"[KILL] 执行后：%@", adSnapshotState());
+        reconBanner(adAdPresent() ? @"秒过失败：广告还在" : @"秒过完成：广告已消失");
+        gAdKillRunning = NO;
+    });
+}
+
+NSString *AdKillSummary(void) {
+    return adSnapshotState();
+}
+
+BOOL AdAutoKillEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"ad_auto_kill"];
+}
+
+void AdSetAutoKill(BOOL enabled) {
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:@"ad_auto_kill"];
+    if (enabled) {
+        gAutoKillCount = 0;
+    }
+    reconLogF(@"[KILL] 自动秒过 %@", enabled ? @"已开启" : @"已关闭");
+}
+
+/* 每秒巡检一次；只认三个明确的广告类，避免误杀支付页倒计时 */
+static void adAutoKillTick(void) {
+    if (!AdAutoKillEnabled() || gAdKillRunning) {
+        return;
+    }
+    if (gAutoKillCount >= 5) {
+        return;
+    }
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (now - gLastAutoKill < 3.0) {
+        return;
+    }
+    if (!adAdPresent()) {
+        return;
+    }
+    gLastAutoKill = now;
+    gAutoKillCount += 1;
+    AdKillRun([NSString stringWithFormat:@"自动第 %d 次", gAutoKillCount]);
+}
+
 #pragma mark - Setup
 
 static void setup() {
@@ -1512,6 +1839,12 @@ static void setup() {
         [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES block:^(NSTimer *timer) {
             (void)timer;
             reconAutoFlush();
+        }];
+
+        // 6.5 自动秒过巡检（1 秒一次；自动开关关着时只是一次 bool 判断，开销可忽略）
+        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
+            (void)timer;
+            adAutoKillTick();
         }];
         gInternalTimerGuard = NO;
 
