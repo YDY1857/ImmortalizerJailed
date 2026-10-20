@@ -16,21 +16,22 @@
 */
 
 /*
-    ===== 修改说明 v8（2026-10）=====
+    ===== 修改说明 v9（2026-10，最后一次实验版）=====
 
-    真机抓日志找到了根因：作者写的匹配字符串在自己的过滤条件里从来没命中过。
+    真机日志找到的根因：作者写的匹配字符串在 iOS 27 上从来没命中过。
+        iOS 27 实际格式：foreground [flag] = NotSet;  foreground [obj] = 0;
+        作者找的是：      foreground = No
+    所以 hook 等于空转，保活失效。
 
-    iOS 27 把这个 settings diff 的 description 格式改了：
-        作者找 "foreground = No"
-        实际是 "foreground [obj] = 0"        （foreground 被拆成 [flag] / [obj] 两个键）
-    加上一条都拦不住，hook 等于原样转发，保活自然失效。
-    这也能解释"用两天后突然失效"——那两天系统还是旧格式，一次小版本更新改掉了。
+    v8 同时把 deactivationReasons 也吞了 → 切回前台直接闪退。
+    v5 / v6 也是同样原因崩的。三次实测结论一致：
+        **只要吞掉失活事件，iOS 27 就会终止进程**（作者 issue #7 记录过）。
 
-    v8 做的事：
-      1. 按真机实测格式重写匹配规则（新格式 + 旧格式都兼容）；
-      2. deactivationReasons 只在被设成具体原因时吞掉，清空的那条必须放行，
-         否则 App 会永远卡在失活态，就是 issue #7 的闪退；
-      3. 日志只记录被拦的、以及带 foreground / deactivationReasons 字样的记录。
+    所以 v9 只做一件事：把 foreground 的匹配改成新格式。
+    deactivationReasons 一律原样放行，一个字都不动。
+
+    如果 v9 还崩，说明"吞任何 scene 更新"在 iOS 27 上都不可行，
+    这条路就彻底到头了，不要再试。
 */
 
 #import <objc/runtime.h>
@@ -96,14 +97,11 @@ static NSString *dropReasonForDiff(NSString *diff) {
     }
 
     /*
-        失活：deactivationReasons 被设成具体原因（systemGesture / systemAnimation）。
-        清空时是 "deactivationReasons = ;"，这一条必须放行 ——
-        全吞掉会让 App 永远卡在失活态，也就是 issue #7 那个闪退。
+        v9：deactivationReasons 这条彻底不碰。
+        实测 v5 / v6 / v8 都证明：只要吞掉失活事件，iOS 27 就会在切回前台时
+        把进程终止掉（作者 issue #7）。所以这里只保留 foreground 分支，
+        deactivationReasons 无论设置还是清空，一律原样放行。
     */
-    if ([diff containsString:@"deactivationReasons"] &&
-        ![diff containsString:@"deactivationReasons = ;"]) {
-        return @"deactivate";
-    }
 
     if ([diff containsString:@"hostContextIdentifierForSnapshotting = 0"] ||
         [diff containsString:@"scenePresenterRenderIdentifierForSnapshotting = 0"] ||
