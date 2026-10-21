@@ -16,6 +16,39 @@
 */
 
 /*
+    ===== 修改说明 v13（2026-10-21）=====
+
+    【v12 真机报告暴露的两个事实】
+    1. 视频快进成功了（4.0s → 108.9s，说明这段视频总长 108.9 秒），但广告没结束。
+       用户截图确认：左上角那行「广告 ∨ ｜ 浏览广告14秒得奖励 ｜ 关闭」就是计时条，
+       "广告结束"只看这 14 秒走没走完，跟视频播到哪一帧没关系。
+    2. 「H5 加速脚本已挂上」这条日志一次都没出现 —— 注入根本没执行。
+       v12 走的是 hook -[WKWebView initWithFrame:configuration:]，那条路没触发。
+
+    【v13 改法：搭支付宝自己的便车】
+    支付宝每开一个 WebView，都会往同一个 WKUserContentController 上加七八个文档期脚本
+    （日志里那些 [WEB] addUserScript 就是）。我们就在 hook addUserScript 里，
+    趁同一个时机往同一个 controller 上挂自己的加速脚本 —— 这条路必然经过，不会再漏。
+
+    【加速范围收窄】
+    v12 把所有 setInterval/setTimeout 一律 ÷8，会把游戏页的网络重试、轮询一起加速，
+    有风控和卡顿风险。v13 只动两类：
+        900~1100ms（典型倒计时）
+        90~110ms（平滑倒计时）
+    其它间隔原样不动。Date.now 仍 8 倍（应对"用时间戳算剩余秒数"的实现），
+    120 秒后全部自动还原。
+
+    【顺手补的观测点】
+    - 启动时写一行「H5 加速状态：开/关」，避免再出现不知道当时开没开的情况
+    - 白名单页面加载时给 URL 打 ★
+    - 新增 hook setAttributedText:（那行 14 秒文字可能是富文本，setText 抓不到）
+    - 快照类名加 AdTagView / AdMessageView / AdCubeCardView / BeeVideoCountdownPlugin
+    - 秒过结束的横幅改成实话：视频层消失 ≠ 广告结束
+
+    ===== 以下是 v11 的说明，保留备查 =====
+*/
+
+/*
     ===== 修改说明 v11（2026-10-20）从"侦察"转"秒过" =====
 
     【v10 真机报告推翻了之前的全部假设】
@@ -163,6 +196,25 @@ static NSString *reconTrim(NSString *s, NSUInteger max) {
     return [[s substringToIndex:max] stringByAppendingString:@"…"];
 }
 
+/* 广告 / 小游戏页面的域名白名单：只有这里的页面才会被 H5 加速 */
+static BOOL adURLIsAdOrGame(NSString *url) {
+    if (url.length == 0) {
+        return NO;
+    }
+    static NSArray<NSString *> *tokens = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        tokens = @[@"paladin:", @"antgame", @"yuyan", @"prizeMachine",
+                   @"antfarm", @"gameTaskSuspend", @"ad_mgr"];
+    });
+    for (NSString *token in tokens) {
+        if ([url rangeOfString:token options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 static void reconAppend(NSString *body) {
     if (!gReconEnabled || body == nil) {
         return;
@@ -252,7 +304,7 @@ static void reconCollectEnv(void) {
     }
 
     @synchronized (gEnvLines) {
-        [gEnvLines addObject:@"扫描器        : AdRecon v12（侦察 + 秒过 + H5加速）"];
+        [gEnvLines addObject:@"扫描器        : AdRecon v13（侦察 + 秒过 + H5加速）"];
         [gEnvLines addObject:[NSString stringWithFormat:@"采集开始      : %@", [NSDate date]]];
         [gEnvLines addObject:[NSString stringWithFormat:@"iOS 版本      : %@", device.systemVersion]];
         [gEnvLines addObject:[NSString stringWithFormat:@"设备型号      : %@", reconSysctlString(@"hw.machine") ?: @"?"]];
@@ -786,6 +838,40 @@ static void hook_setText(id self, SEL _cmd, id text) {
     }
 }
 
+#pragma mark - Hook：UILabel 富文本（有些倒计时走 attributedText，setText 抓不到）
+
+static void (*orig_setAttributedText)(id, SEL, id);
+static void hook_setAttributedText(id self, SEL _cmd, id attributedText) {
+    if (orig_setAttributedText) {
+        orig_setAttributedText(self, _cmd, attributedText);
+    }
+    @try {
+        UIView *hostWindow = [self window];
+        if (hostWindow != nil &&
+            [NSStringFromClass([hostWindow class]) containsString:@"FloatingButton"]) {
+            return;
+        }
+        if (![attributedText respondsToSelector:@selector(string)]) {
+            return;
+        }
+        NSString *str = [attributedText string];
+        if (![str isKindOfClass:[NSString class]] || str.length == 0 || str.length > 60) {
+            return;
+        }
+        if ([str rangeOfString:@"秒"].location == NSNotFound &&
+            [str rangeOfString:@"广告"].location == NSNotFound &&
+            [str rangeOfString:@"奖励"].location == NSNotFound) {
+            return;
+        }
+        NSString *key = [NSString stringWithFormat:@"atxt:%@:%@", NSStringFromClass([self class]), str];
+        if (reconAllow(key, 1.0)) {
+            reconLogF(@"[LBL·富文本] %@ →「%@」", NSStringFromClass([self class]), str);
+        }
+    } @catch (NSException *e) {
+        (void)e;
+    }
+}
+
 #pragma mark - Hook：定时器（找 15 秒倒计时的驱动源）
 
 static NSString *reconTimerStar(double interval) {
@@ -895,7 +981,9 @@ static id hook_loadRequest(id self, SEL _cmd, id request) {
                 urlString = [(NSURL *)urlObj absoluteString] ?: @"(nil)";
             }
         }
-        reconLogF(@"[WEB] loadRequest %@", reconTrim(urlString, 300));
+        reconLogF(@"[WEB] loadRequest %@%@",
+                  adURLIsAdOrGame(urlString) ? @"★ 广告/游戏页（H5 加速应在文档期生效） " : @"",
+                  reconTrim(urlString, 300));
     } @catch (NSException *e) {
         (void)e;
     }
@@ -922,8 +1010,14 @@ static id hook_loadHTML(id self, SEL _cmd, id html, id baseURL) {
     return orig_loadHTML(self, _cmd, html, baseURL);
 }
 
+/* 定义在广告秒过模块里 */
+static void adPiggybackSpeedScript(id controller);
+
 static void (*orig_addUserScript)(id, SEL, id);
 static void hook_addUserScript(id self, SEL _cmd, id script) {
+    if (orig_addUserScript) {
+        orig_addUserScript(self, _cmd, script);
+    }
     @try {
         if ([script respondsToSelector:@selector(source)]) {
             NSString *source = [script source];
@@ -934,8 +1028,17 @@ static void hook_addUserScript(id self, SEL _cmd, id script) {
     } @catch (NSException *e) {
         (void)e;
     }
-    if (orig_addUserScript) {
-        orig_addUserScript(self, _cmd, script);
+
+    /*
+        v13 关键：搭支付宝自己的便车。
+        支付宝每开一个 WebView 都会往同一个 controller 上加七八个文档期脚本，
+        我们就借着这个时机往同一个 controller 上挂自己的加速脚本。
+        这比 hook WKWebView 的初始化可靠得多 —— v12 走 init 那条路一次都没触发。
+    */
+    @try {
+        adPiggybackSpeedScript(self);
+    } @catch (NSException *e) {
+        (void)e;
     }
 }
 
@@ -1123,6 +1226,7 @@ static void reconInstallHooks(void) {
 
         /* --- UILabel --- */
         RECON_HOOK_I("UILabel", "setText:", hook_setText, orig_setText);
+        RECON_HOOK_I("UILabel", "setAttributedText:", hook_setAttributedText, orig_setAttributedText);
 
         /* --- 定时器 --- */
         RECON_HOOK_C("NSTimer", "scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:", hook_timerTarget, orig_timerTarget);
@@ -1350,7 +1454,7 @@ static NSString *reconReportTextInternal(void) {
     NSMutableString *out = [NSMutableString string];
 
     [out appendString:@"================================================================\n"];
-    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v12）\n"];
+    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v13）\n"];
     [out appendString:@"   由注入版 dylib 自动生成，直接把这个文件发给元宝\n"];
     [out appendString:@"================================================================\n\n"];
 
@@ -1440,7 +1544,7 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"        Swift 内部符号、服务端下发的动态脚本。\n"];
     [out appendString:@"如果报告里一片空白，说明广告全在这些层面，需要换侦察手段。\n\n"];
 
-    [out appendString:@"【六、秒过能力（v12）】\n"];
+    [out appendString:@"【六、秒过能力（v13）】\n"];
     [out appendString:@"静态分析自 AlipayWallet 12.12.30 的 __objc_methtype，签名已核对：\n"];
     [out appendString:@"  AdOpenScreenView    -exitAd / -exiAdWhenTimeOver   零参数\n"];
     [out appendString:@"  CountdownButton     -setRemainingTime:(double) + -updateCountdown\n"];
@@ -1455,7 +1559,7 @@ static NSString *reconReportTextInternal(void) {
 
     [out appendString:@"【七、生成信息】\n"];
     [out appendFormat:@"生成时间: %@\n", [NSDate date]];
-    [out appendFormat:@"插件版本: AdRecon v12\n"];
+    [out appendFormat:@"插件版本: AdRecon v13\n"];
     [out appendFormat:@"设备    : %@ / iOS %@\n",
      reconSysctlString(@"hw.machine") ?: @"?",
      [[UIDevice currentDevice] systemVersion]];
@@ -1486,7 +1590,7 @@ NSString *ReconWriteReportFile(void) {
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [formatter stringFromDate:[NSDate date]];
-    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v12-%@.txt", stamp];
+    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v13-%@.txt", stamp];
     NSString *path = [dir stringByAppendingPathComponent:fileName];
 
     NSError *error = nil;
@@ -1633,7 +1737,8 @@ static NSString *adSnapshotState(void) {
     dispatch_once(&once, ^{
         names = @[@"AdOpenScreenView", @"AdRewardView", @"AdRewardedVideoView",
                   @"AdInterstitialView", @"CDPHugeAdView", @"AdBannerView",
-                  @"CountdownButton", @"BeeVideoPlayerView"];
+                  @"AdTagView", @"AdMessageView", @"AdCubeCardView",
+                  @"BeeVideoPlayerView", @"BeeVideoCountdownPlugin", @"CountdownButton"];
     });
 
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
@@ -1693,8 +1798,13 @@ static NSString *adSpeedDocumentJS(void) {
             @"if(window.__adSpeedOn){return;}window.__adSpeedOn=1;"
             @"var F=8;"
             @"var oSI=window.setInterval,oST=window.setTimeout,oNow=Date.now.bind(Date),t0=oNow();"
-            @"window.setInterval=function(f,d){var n=(typeof d==='number'&&d>0)?Math.max(1,d/F):d;return oSI.call(window,f,n);};"
-            @"window.setTimeout=function(f,d){var n=(typeof d==='number'&&d>0)?Math.max(0,d/F):d;return oST.call(window,f,n);};"
+            @"function fast(d){"
+            @"if(typeof d!=='number'||d<=0){return d;}"
+            @"if(d>=900&&d<=1100){return Math.max(1,d/F);}"
+            @"if(d>=90&&d<=110){return Math.max(1,d/F);}"
+            @"return d;}"
+            @"window.setInterval=function(f,d){return oSI.call(window,f,fast(d));};"
+            @"window.setTimeout=function(f,d){return oST.call(window,f,fast(d));};"
             @"Date.now=function(){return t0+(oNow()-t0)*F;};"
             @"oST.call(window,function(){window.setInterval=oSI;window.setTimeout=oST;Date.now=oNow;window.__adSpeedOn=0;},120000);"
             @"}catch(e){}})();";
@@ -1757,42 +1867,62 @@ void AdSetJSSpeed(BOOL enabled) {
     reconLogF(@"[KILL] H5 加速 %@（对之后新打开的页面生效）", enabled ? @"已开启" : @"已关闭");
 }
 
-static void adInjectSpeedIntoConfiguration(id configuration) {
-    if (configuration == nil || !AdJSSpeedEnabled()) {
+/* 真正干活的：往某个 WKUserContentController 上挂一次加速脚本 */
+static void adPiggybackSpeedScript(id controller) {
+    if (controller == nil) {
         return;
     }
-    if (objc_getAssociatedObject(configuration, kAdSpeedInjectedKey) != nil) {
+    if (!AdJSSpeedEnabled()) {
+        if (reconAllow(@"h5skip", 60.0)) {
+            reconLogF(@"[KILL] H5 加速处于关闭状态，本次不注入（面板第一行可开）");
+        }
         return;
     }
-    objc_setAssociatedObject(configuration, kAdSpeedInjectedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (objc_getAssociatedObject(controller, kAdSpeedInjectedKey) != nil) {
+        return;
+    }
+    objc_setAssociatedObject(controller, kAdSpeedInjectedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+    @try {
+        Class scriptCls = NSClassFromString(@"WKUserScript");
+        if (scriptCls == NULL || orig_addUserScript == NULL) {
+            reconLogF(@"[KILL] 注入失败：WKUserScript=%d orig_addUserScript=%d",
+                      scriptCls != NULL, orig_addUserScript != NULL);
+            return;
+        }
+        id alloced = ((id (*)(id, SEL))objc_msgSend)(scriptCls, sel_getUid("alloc"));
+        /* injectionTime 0 = AtDocumentStart，forMainFrameOnly NO = iframe 也注入 */
+        id mine = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(
+            alloced,
+            sel_getUid("initWithSource:injectionTime:forMainFrameOnly:"),
+            adSpeedDocumentJS(), (NSInteger)0, (BOOL)NO);
+        if (mine == nil) {
+            reconLogF(@"[KILL] 注入失败：WKUserScript 创建不出来");
+            return;
+        }
+        /* 直接调原实现，绕开自己的 hook，避免递归 */
+        orig_addUserScript(controller, sel_getUid("addUserScript:"), mine);
+        reconLogF(@"[KILL] ★ H5 加速脚本已挂上（文档开始注入）· %@",
+                  NSStringFromClass([controller class]));
+    } @catch (NSException *e) {
+        reconLogF(@"[KILL] 挂 H5 脚本异常：%@", e.reason ?: @"?");
+    }
+}
+
+/* 备用入口：从 WKWebViewConfiguration 拿 controller 再挂（v12 那条路，保留兜底） */
+static void adInjectSpeedIntoConfiguration(id configuration) {
+    if (configuration == nil) {
+        return;
+    }
     @try {
         SEL uccSel = sel_getUid("userContentController");
         if (![configuration respondsToSelector:uccSel]) {
             return;
         }
         id controller = ((id (*)(id, SEL))objc_msgSend)(configuration, uccSel);
-        if (controller == nil) {
-            return;
-        }
-
-        Class scriptCls = NSClassFromString(@"WKUserScript");
-        if (scriptCls == NULL) {
-            return;
-        }
-        id alloced = ((id (*)(id, SEL))objc_msgSend)(scriptCls, sel_getUid("alloc"));
-        /* injectionTime 0 = AtDocumentStart，forMainFrameOnly NO = iframe 也注入 */
-        id script = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(
-            alloced,
-            sel_getUid("initWithSource:injectionTime:forMainFrameOnly:"),
-            adSpeedDocumentJS(), (NSInteger)0, (BOOL)NO);
-
-        if (script != nil) {
-            ((void (*)(id, SEL, id))objc_msgSend)(controller, sel_getUid("addUserScript:"), script);
-            reconLogF(@"[KILL] 已给新 WebView 挂上 H5 加速脚本");
-        }
+        adPiggybackSpeedScript(controller);
     } @catch (NSException *e) {
-        reconLogF(@"[KILL] 挂 H5 脚本失败：%@", e.reason ?: @"?");
+        (void)e;
     }
 }
 
@@ -1948,7 +2078,8 @@ void AdKillRun(NSString *reason) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((delay + 0.8) * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         reconLogF(@"[KILL] 执行后：%@", adSnapshotState());
-        reconBanner(adAnyAdViewPresent() ? @"秒过结束：广告仍在" : @"秒过完成：广告已消失");
+        reconBanner(adAnyAdViewPresent() ? @"秒过结束：广告仍在"
+                                         : @"秒过执行完毕（视频层已撤，但广告页可能还在，请以屏幕为准）");
         gAdKillRunning = NO;
     });
 }
@@ -2024,6 +2155,7 @@ static void setup() {
 
         // 5. 侦察 hook
         reconInstallHooks();
+        reconLogF(@"[KILL] H5 加速状态：%@（白名单页面文档期注入）", AdJSSpeedEnabled() ? @"开" : @"关");
 
         // 6. 每 5 秒自动落盘一次，防止崩溃丢日志
         gInternalTimerGuard = YES;
