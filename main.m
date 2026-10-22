@@ -16,6 +16,35 @@
 */
 
 /*
+    ===== 修改说明 v14（2026-10-21）加探针，不再瞎猜 =====
+
+    【v13 报告的结果：注入成功，但打不中】
+    `★ H5 加速脚本已挂上` 出现 4 次（10.06s / 18.32s，都在页面 load 之前），
+    说明搭便车注入这条路是通的。但广告照样没结束。
+
+    报告里另两个硬事实：
+      · 整段时间没有 1 秒的重复定时器，只有稀疏的 one-shot（CKTimerTarget 1s，约 10 秒一次）
+      · 一条 [LBL] 都没抓到「浏览广告14秒」，连 setAttributedText 也没有
+    结论：那行 14 秒既不是 UILabel，也不是 NSTimer 驱动。
+    它跑在小游戏自己的 JS 引擎里（不是 WKWebView 的 window），
+    所以我们改 window.setInterval / Date.now 根本碰不到。
+
+    【v14 只做侦察，不再乱打】
+    ① 界面树带文字：reconDumpView 现在会把每个节点的 text / attributedText 一起打出来，
+       下次报告里能直接看到「浏览广告14秒」画在哪个类上。
+    ② 探针 [PROBE]：在广告条那一带（顶部 y=46/62/80/120）做 hitTest，
+       打出命中视图的完整类名链；如果文字里带 秒/广告/奖励/跳过，
+       顺手把那个类以及它父类的实例方法全表打出来（[CLASS] 行）。
+    ③ H5 自检 [H5·自检#n]：evaluateJavaScript 读回 window.__adSpeedOn，
+       返回 speed=1 才说明加速脚本真的在页面里跑了；返回 0 说明注入白挂了。
+       这一条能一次性判定"H5 路线到底可不可行"。
+
+    拿到这三份数据，下一版就能照着方法名精准调用，不用再一轮一轮试。
+
+    ===== 以下是 v13 的说明，保留备查 =====
+*/
+
+/*
     ===== 修改说明 v13（2026-10-21）=====
 
     【v12 真机报告暴露的两个事实】
@@ -304,7 +333,7 @@ static void reconCollectEnv(void) {
     }
 
     @synchronized (gEnvLines) {
-        [gEnvLines addObject:@"扫描器        : AdRecon v13（侦察 + 秒过 + H5加速）"];
+        [gEnvLines addObject:@"扫描器        : AdRecon v14（侦察 + 探针 + H5加速）"];
         [gEnvLines addObject:[NSString stringWithFormat:@"采集开始      : %@", [NSDate date]]];
         [gEnvLines addObject:[NSString stringWithFormat:@"iOS 版本      : %@", device.systemVersion]];
         [gEnvLines addObject:[NSString stringWithFormat:@"设备型号      : %@", reconSysctlString(@"hw.machine") ?: @"?"]];
@@ -509,17 +538,68 @@ static void reconDumpView(UIView *view, int depth, NSMutableString *out, int *bu
         [indent appendString:@"  "];
     }
 
+    /* v14：把节点上的文字也带出来，才能定位"浏览广告14秒"到底画在哪个类上 */
+    NSString *textPart = @"";
+    @try {
+        SEL textSel = sel_getUid("text");
+        if ([view respondsToSelector:textSel]) {
+            id value = ((id (*)(id, SEL))objc_msgSend)(view, textSel);
+            if ([value isKindOfClass:[NSString class]] && ((NSString *)value).length > 0) {
+                textPart = [NSString stringWithFormat:@" 「%@」", reconTrim((NSString *)value, 30)];
+            }
+        }
+        if (textPart.length == 0) {
+            SEL attrSel = sel_getUid("attributedText");
+            if ([view respondsToSelector:attrSel]) {
+                id value = ((id (*)(id, SEL))objc_msgSend)(view, attrSel);
+                if ([value respondsToSelector:@selector(string)]) {
+                    NSString *s = ((NSString * (*)(id, SEL))objc_msgSend)(value, sel_getUid("string"));
+                    if ([s isKindOfClass:[NSString class]] && s.length > 0) {
+                        textPart = [NSString stringWithFormat:@" 「%@」", reconTrim(s, 30)];
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        (void)e;
+    }
+
     CGRect frame = view.frame;
-    [out appendFormat:@"%@%@ (%.0f,%.0f %.0fx%.0f)%@%@\n",
+    [out appendFormat:@"%@%@ (%.0f,%.0f %.0fx%.0f)%@%@%@\n",
      indent,
      NSStringFromClass([view class]),
      frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
      view.hidden ? @" [hidden]" : @"",
-     view.alpha < 0.05 ? @" [alpha≈0]" : @""];
+     view.alpha < 0.05 ? @" [alpha≈0]" : @"",
+     textPart];
 
     for (UIView *sub in view.subviews) {
         reconDumpView(sub, depth + 1, out, budget);
     }
+}
+
+/* v14：把某个类的实例方法名全列出来，下一版好照着方法名精准调用 */
+static void reconDumpClassMethods(Class cls, NSString *why) {
+    if (cls == Nil) {
+        return;
+    }
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (methods == NULL) {
+        return;
+    }
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (unsigned int i = 0; i < count && names.count < 90; i++) {
+        NSString *name = NSStringFromSelector(method_getName(methods[i]));
+        if (name.length > 0) {
+            [names addObject:name];
+        }
+    }
+    free(methods);
+    reconLogF(@"[CLASS] %@ 共 %u 个方法（%lu 个已列）· 来源：%@",
+              NSStringFromClass(cls), count, (unsigned long)names.count, why ?: @"?");
+    reconLogF(@"[CLASS] %@ → %@", NSStringFromClass(cls),
+              [names componentsJoinedByString:@", "]);
 }
 
 static NSArray<UIWindow *> *reconAllWindows(void) {
@@ -1454,7 +1534,7 @@ static NSString *reconReportTextInternal(void) {
     NSMutableString *out = [NSMutableString string];
 
     [out appendString:@"================================================================\n"];
-    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v13）\n"];
+    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v14）\n"];
     [out appendString:@"   由注入版 dylib 自动生成，直接把这个文件发给元宝\n"];
     [out appendString:@"================================================================\n\n"];
 
@@ -1544,22 +1624,26 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"        Swift 内部符号、服务端下发的动态脚本。\n"];
     [out appendString:@"如果报告里一片空白，说明广告全在这些层面，需要换侦察手段。\n\n"];
 
-    [out appendString:@"【六、秒过能力（v13）】\n"];
+    [out appendString:@"【六、秒过能力（v14）】\n"];
     [out appendString:@"静态分析自 AlipayWallet 12.12.30 的 __objc_methtype，签名已核对：\n"];
     [out appendString:@"  AdOpenScreenView    -exitAd / -exiAdWhenTimeOver   零参数\n"];
     [out appendString:@"  CountdownButton     -setRemainingTime:(double) + -updateCountdown\n"];
     [out appendString:@"  AdRewardView        -countDownFinish               零参数\n"];
     [out appendString:@"  AdRewardedVideoView -countDownEnd                  零参数\n"];
     [out appendString:@"  BeeVideoPlayerView  -seekToTime:(double) / -getCurrentTime\n"];
-    [out appendString:@"执行顺序：倒计时归零 → 视频快进 → 再快进 → 激励结束 → 激励视频结束\n"];
-    [out appendString:@"          → 开屏时间到 → 开屏退出 → H5 补刀(时间加速+video 拖尾)\n"];
+    [out appendString:@"执行顺序：①倒计时归零 ②视频快进 ③再快进 ④探针 ⑤激励结束\n"];
+    [out appendString:@"          ⑥激励视频结束 ⑦开屏时间到 ⑧开屏退出 ⑨H5补刀 ⑩H5自检\n"];
     [out appendString:@"每步间隔 0.6 秒，广告一消失就跳过后续步骤。日志里搜 [KILL] 能看到过程。\n"];
     [out appendString:@"H5 加速：文档期注入，只对 paladin/antgame/yuyan/prizeMachine/antfarm/\n"];
-    [out appendString:@"gameTaskSuspend/ad_mgr 生效，加速 8 倍，120 秒后自动还原。\n\n"];
+    [out appendString:@"gameTaskSuspend/ad_mgr 生效；只加速 900~1100ms 和 90~110ms 的定时器，\n"];
+    [out appendString:@"其它间隔不动；Date.now 8 倍；120 秒后自动还原。\n"];
+    [out appendString:@"探针：[PROBE] 是在广告条位置做命中测试打出来的类名链，\n"];
+    [out appendString:@"      [CLASS] 是命中类的实例方法全表，用来定位计时逻辑。\n"];
+    [out appendString:@"自检：[H5·自检#n] 是页面里读回 speed=1 表示加速脚本确实跑了。\n\n"];
 
     [out appendString:@"【七、生成信息】\n"];
     [out appendFormat:@"生成时间: %@\n", [NSDate date]];
-    [out appendFormat:@"插件版本: AdRecon v13\n"];
+    [out appendFormat:@"插件版本: AdRecon v14\n"];
     [out appendFormat:@"设备    : %@ / iOS %@\n",
      reconSysctlString(@"hw.machine") ?: @"?",
      [[UIDevice currentDevice] systemVersion]];
@@ -1590,7 +1674,7 @@ NSString *ReconWriteReportFile(void) {
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [formatter stringFromDate:[NSDate date]];
-    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v13-%@.txt", stamp];
+    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v14-%@.txt", stamp];
     NSString *path = [dir stringByAppendingPathComponent:fileName];
 
     NSError *error = nil;
@@ -1943,6 +2027,123 @@ static void adInstallSpeedHook(void) {
     RECON_HOOK_I("WKWebView", "initWithFrame:configuration:", hook_wkInitWithConfig, orig_wkInitWithConfig);
 }
 
+static void adEvalJSWithLog(id webView, NSString *js, NSString *tag) {
+    if (webView == nil || js.length == 0) {
+        return;
+    }
+    SEL sel = sel_getUid("evaluateJavaScript:completionHandler:");
+    if (![webView respondsToSelector:sel]) {
+        return;
+    }
+    id handler = ^(id result, NSError *error) {
+        NSString *desc = nil;
+        if (error != nil) {
+            desc = [NSString stringWithFormat:@"error:%@", error.localizedDescription ?: @"?"];
+        } else {
+            desc = [NSString stringWithFormat:@"%@", result];
+        }
+        reconLogF(@"[H5·%@] ← %@", tag ?: @"?", reconTrim(desc, 170));
+    };
+    @try {
+        ((void (*)(id, SEL, id, id))objc_msgSend)(webView, sel, js, handler);
+    } @catch (NSException *e) {
+        reconLogF(@"[H5·%@] 调用异常：%@", tag ?: @"?", e.reason ?: @"?");
+    }
+}
+
+/* v14：问一下页面里我们的加速脚本到底跑没跑 */
+static void adH5SelfCheck(void) {
+    NSString *js = @"(function(){try{"
+                   @"return 'speed='+(window.__adSpeedOn||0)"
+                   @"+' | href='+String(location.href||'').slice(0,110);"
+                   @"}catch(e){return 'err:'+e;}})();";
+
+    Class wkCls = NSClassFromString(@"WKWebView");
+    NSMutableArray *webViews = [NSMutableArray array];
+    for (UIWindow *win in reconAllWindows()) {
+        adCollectViews(win, wkCls, webViews, 0);
+    }
+    NSInteger index = 0;
+    for (id webView in webViews) {
+        index += 1;
+        adEvalJSWithLog(webView, js, [NSString stringWithFormat:@"自检#%ld", (long)index]);
+    }
+    reconLogF(@"[H5] 自检请求已发往 %ld 个 WebView", (long)index);
+}
+
+/* v14：在广告条那一带做命中测试，把类名链打出来 */
+static void adProbeTopBar(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            adProbeTopBar();
+        });
+        return;
+    }
+
+    NSArray<NSNumber *> *xs = @[@40, @150, @300, @400];
+    NSArray<NSNumber *> *ys = @[@46, @62, @80, @120];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    NSInteger hits = 0;
+
+    for (UIWindow *win in reconAllWindows()) {
+        CGRect bounds = win.bounds;
+        for (NSNumber *yn in ys) {
+            for (NSNumber *xn in xs) {
+                CGPoint point = CGPointMake(xn.doubleValue, yn.doubleValue);
+                if (!CGRectContainsPoint(bounds, point)) {
+                    continue;
+                }
+                @try {
+                    UIView *hit = [win hitTest:point withEvent:nil];
+                    if (hit == nil) {
+                        continue;
+                    }
+                    NSMutableArray<NSString *> *chain = [NSMutableArray array];
+                    UIView *cursor = hit;
+                    int depth = 0;
+                    while (cursor != nil && depth < 8) {
+                        NSString *cls = NSStringFromClass([cursor class]);
+                        [chain addObject:(cls.length > 0 ? cls : @"?")];
+                        cursor = cursor.superview;
+                        depth += 1;
+                    }
+                    NSString *key = [chain componentsJoinedByString:@"<"];
+                    if ([seen containsObject:key]) {
+                        continue;
+                    }
+                    [seen addObject:key];
+                    hits += 1;
+
+                    /* 把命中视图上的文字也带出来 */
+                    NSString *text = @"";
+                    SEL textSel = sel_getUid("text");
+                    if ([hit respondsToSelector:textSel]) {
+                        id value = ((id (*)(id, SEL))objc_msgSend)(hit, textSel);
+                        if ([value isKindOfClass:[NSString class]]) {
+                            text = reconTrim((NSString *)value, 40);
+                        }
+                    }
+                    reconLogF(@"[PROBE] (%.0f,%.0f) → %@  文本「%@」", point.x, point.y, key, text);
+
+                    if ([text rangeOfString:@"秒"].location != NSNotFound ||
+                        [text rangeOfString:@"广告"].location != NSNotFound ||
+                        [text rangeOfString:@"奖励"].location != NSNotFound ||
+                        [text rangeOfString:@"跳过"].location != NSNotFound) {
+                        reconLogF(@"[PROBE] ★ 这一层可能就是计时条，把它的方法列出来");
+                        reconDumpClassMethods([hit class], @"计时条命中");
+                        if (hit.superview != nil) {
+                            reconDumpClassMethods([hit.superview class], @"计时条父视图");
+                        }
+                    }
+                } @catch (NSException *e) {
+                    (void)e;
+                }
+            }
+        }
+    }
+    reconLogF(@"[PROBE] 共命中 %ld 个不同层级", (long)hits);
+}
+
 static void adPerformStep(NSString *step) {
     @try {
         if ([step isEqualToString:@"countdown-zero"]) {
@@ -1972,6 +2173,11 @@ static void adPerformStep(NSString *step) {
                 reconLogF(@"[KILL] ②视频快进 %.1fs → seek=%@ → 现在 %.1fs",
                           before, ok ? @"OK" : @"NO", after);
             }
+            return;
+        }
+
+        if ([step isEqualToString:@"probe-ui"]) {
+            adProbeTopBar();
             return;
         }
 
@@ -2034,6 +2240,11 @@ static void adPerformStep(NSString *step) {
             reconLogF(@"[KILL] ⑦H5 补刀：已注入 %ld 个 WebView", (long)count);
             return;
         }
+
+        if ([step isEqualToString:@"h5-check"]) {
+            adH5SelfCheck();
+            return;
+        }
     } @catch (NSException *e) {
         reconLogF(@"[KILL] 步骤 %@ 异常：%@", step, e.reason ?: @"?");
     }
@@ -2064,8 +2275,9 @@ void AdKillRun(NSString *reason) {
     }
 
     NSArray<NSString *> *steps = @[@"countdown-zero", @"video-seek-end", @"video-seek-again",
-                                   @"reward-finish", @"rewardvideo-end",
-                                   @"openscreen-timeover", @"openscreen-exit", @"js-speed"];
+                                   @"probe-ui", @"reward-finish", @"rewardvideo-end",
+                                   @"openscreen-timeover", @"openscreen-exit",
+                                   @"js-speed", @"h5-check"];
     double delay = 0.0;
     for (NSString *step in steps) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),

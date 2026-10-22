@@ -531,7 +531,7 @@ static NSData *makeInaudibleWav(void) {
         textView.font = mono ?: [UIFont systemFontOfSize:10.0];
 
         UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w - 120, 34)];
-        titleLabel.text = @"AdRecon v13 侦察 + 秒过";
+        titleLabel.text = @"AdRecon v14 侦察 + 秒过";
         titleLabel.textColor = [UIColor whiteColor];
         titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
 
@@ -640,7 +640,7 @@ static NSData *makeInaudibleWav(void) {
     [self showSimpleToast:[NSString stringWithFormat:@"秒过中… 当前 %@", before]];
 
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.2 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         [strongSelf showSimpleToast:[NSString stringWithFormat:@"结果：%@", AdKillSummary()]];
@@ -762,22 +762,22 @@ static NSData *makeInaudibleWav(void) {
 
 - (NSString *)statusText {
     if (!self.isImmortalized) {
-        return @"v13 · 就绪（长按出面板）";
+        return @"v14 · 就绪（长按出面板）";
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v13 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v14 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v13 · 音频运行中";
+        return @"v14 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v13 · 音频未启动";
+        return @"v14 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v13 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v14 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）
