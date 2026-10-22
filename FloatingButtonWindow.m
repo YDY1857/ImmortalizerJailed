@@ -47,6 +47,7 @@
 */
 
 #import "FloatingButtonWindow.h"
+#import <notify.h>
 #import <math.h>
 
 /*
@@ -117,6 +118,11 @@ extern void AdSetAutoKill(BOOL enabled);
 extern BOOL AdJSSpeedEnabled(void);
 extern void AdSetJSSpeed(BOOL enabled);
 
+/* 由 main.m 提供：后台续跑开关（v15） */
+extern BOOL AdBgKeepEnabled(void);
+extern void AdSetBgKeep(BOOL enabled);
+extern void AdPrimeBackgroundPlayback(void);
+
 @interface FloatingButtonWindow ()
 @property (nonatomic, strong) UIButton *floatingButton;
 @property (nonatomic, strong) UIView *handleView;
@@ -135,6 +141,7 @@ extern void AdSetJSSpeed(BOOL enabled);
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @property (nonatomic, strong) UIButton *autoKillButton;
 @property (nonatomic, strong) UIButton *jsSpeedButton;
+@property (nonatomic, strong) UIButton *bgKeepButton;
 
 /* 这几个方法定义在下面，但被更早的方法调用（showLogPanel）。
    显式声明一遍，避免 "instance method not found" 类警告；
@@ -148,6 +155,7 @@ extern void AdSetJSSpeed(BOOL enabled);
 - (void)showSimpleToast:(NSString *)text;
 - (void)refreshAutoKillButton;
 - (void)refreshJSSpeedButton;
+- (void)refreshBgKeepButton;
 - (void)exportReportTapped;
 - (void)copyReportTapped;
 - (void)markTapped;
@@ -155,6 +163,11 @@ extern void AdSetJSSpeed(BOOL enabled);
 - (void)adKillTapped;
 - (void)autoKillTapped;
 - (void)jsSpeedTapped;
+- (void)bgKeepTapped;
+- (void)forceEnableKeepAlive;
+- (void)updateButtonColor;
+- (void)startTimer;
+- (void)stopTimer;
 @end
 
 static void vibrateDevice() {
@@ -263,6 +276,16 @@ static NSData *makeInaudibleWav(void) {
     self.rootViewController = [[UIViewController alloc] init];
     self.rootViewController.view.backgroundColor = [UIColor clearColor];
     self.hidden = YES;
+
+    /* v15：main.m 检测到广告播放器就发这个通知，我们顺手把音频保活打开 */
+    __weak typeof(self) weakSelf = self;
+    int token = 0;
+    notify_register_dispatch("com.sergy.immortalizerjailed.bgkeep", &token,
+                             dispatch_get_main_queue(), ^(int t) {
+        (void)t;
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf forceEnableKeepAlive];
+    });
 }
 
 - (void)setupButton {
@@ -531,7 +554,7 @@ static NSData *makeInaudibleWav(void) {
         textView.font = mono ?: [UIFont systemFontOfSize:10.0];
 
         UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w - 120, 34)];
-        titleLabel.text = @"AdRecon v14 侦察 + 秒过";
+        titleLabel.text = @"AdRecon v15 后台续跑 + 秒过";
         titleLabel.textColor = [UIColor whiteColor];
         titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
 
@@ -542,17 +565,21 @@ static NSData *makeInaudibleWav(void) {
         closeButton.titleLabel.font = [UIFont systemFontOfSize:15.0];
         [closeButton addTarget:self action:@selector(hideLogPanel) forControlEvents:UIControlEventTouchUpInside];
 
-        /* 第一行：侦察 + H5 加速 */
-        UIStackView *row1 = [self buildButtonRowWithTitles:@[@"导出TXT", @"复制全文", @"抓界面", @"JS加速:开"]
-                                                selectors:@[@"exportReportTapped", @"copyReportTapped", @"snapshotTapped", @"jsSpeedTapped"]
+        /* 第一行：侦察 + 后台续跑 */
+        UIStackView *row1 = [self buildButtonRowWithTitles:@[@"导出TXT", @"复制全文", @"抓界面", @"后台:开"]
+                                                selectors:@[@"exportReportTapped", @"copyReportTapped", @"snapshotTapped", @"bgKeepTapped"]
                                                     frame:CGRectMake(10, row1Y, w - 20, 40)];
 
         /* 第二行：秒过相关 */
-        UIStackView *row2 = [self buildButtonRowWithTitles:@[@"秒过广告", @"自动:关", @"打标记"]
-                                                selectors:@[@"adKillTapped", @"autoKillTapped", @"markTapped"]
+        UIStackView *row2 = [self buildButtonRowWithTitles:@[@"秒过广告", @"自动:关", @"JS加速:开"]
+                                                selectors:@[@"adKillTapped", @"autoKillTapped", @"jsSpeedTapped"]
                                                     frame:CGRectMake(10, row2Y, w - 20, 40)];
 
-        UIButton *jsButton = (UIButton *)row1.arrangedSubviews[3];
+        UIButton *bgButton = (UIButton *)row1.arrangedSubviews[3];
+        self.bgKeepButton = bgButton;
+        [self refreshBgKeepButton];
+
+        UIButton *jsButton = (UIButton *)row2.arrangedSubviews[2];
         self.jsSpeedButton = jsButton;
         [self refreshJSSpeedButton];
 
@@ -621,6 +648,42 @@ static NSData *makeInaudibleWav(void) {
     self.jsSpeedButton.backgroundColor = on
         ? [UIColor colorWithRed:0.16 green:0.42 blue:0.78 alpha:1.0]
         : [UIColor colorWithWhite:0.22 alpha:1.0];
+}
+
+- (void)refreshBgKeepButton {
+    if (self.bgKeepButton == nil) {
+        return;
+    }
+    BOOL on = AdBgKeepEnabled();
+    [self.bgKeepButton setTitle:(on ? @"后台:开" : @"后台:关") forState:UIControlStateNormal];
+    self.bgKeepButton.backgroundColor = on
+        ? [UIColor colorWithRed:0.16 green:0.42 blue:0.78 alpha:1.0]
+        : [UIColor colorWithWhite:0.22 alpha:1.0];
+}
+
+/* 后台续跑必须配合音频保活，否则进程被挂起，倒计时照样停 */
+- (void)forceEnableKeepAlive {
+    if (self.isImmortalized) {
+        return;
+    }
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"immortalized"];
+    self.isImmortalized = YES;
+    notify_post("com.sergy.immortalizerjailed.updateprefs");
+    [self updateButtonColor];
+    [self startTimer];
+}
+
+- (void)bgKeepTapped {
+    BOOL next = !AdBgKeepEnabled();
+    AdSetBgKeep(next);
+    [self refreshBgKeepButton];
+    if (next) {
+        [self forceEnableKeepAlive];
+        AdPrimeBackgroundPlayback();
+        [self showSimpleToast:@"后台续跑已开 · 音频保活已同步打开"];
+    } else {
+        [self showSimpleToast:@"后台续跑已关 · 页面进后台会正常暂停"];
+    }
 }
 
 - (void)jsSpeedTapped {
@@ -762,22 +825,22 @@ static NSData *makeInaudibleWav(void) {
 
 - (NSString *)statusText {
     if (!self.isImmortalized) {
-        return @"v14 · 就绪（长按出面板）";
+        return @"v15 · 就绪（长按出面板）";
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v14 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v15 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v14 · 音频运行中";
+        return @"v15 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v14 · 音频未启动";
+        return @"v15 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v14 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v15 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）

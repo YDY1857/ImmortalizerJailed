@@ -16,6 +16,42 @@
 */
 
 /*
+    ===== 修改说明 v15（2026-10-22）换回你真正想要的那条路 =====
+
+    【v14 探针结果】
+      · [H5·自检] 三个 WebView 全部返回 speed=0
+        → 文档期注入那条路对这几个页面不生效，H5 加速打不进去
+      · [PROBE] 广告条整条都是原生 Cube 组件：
+        CKPView<CKPView<CKPView<CubeViewNGImpl<AntCubeView<RNGOverlayContainerView
+        且 text 为空 —— 倒计时不是 UILabel 画的，也不在 H5 的 DOM 里
+      · 全程没有 1 秒重复定时器
+    合起来：14 秒倒计时既不在 WKWebView 的 window 上，也不是 NSTimer，
+    而是小游戏容器（AntCube / RNG）里的原生逻辑。
+
+    【v15 换路：不做"秒过"，做"后台继续跑"】
+    从二进制里翻到一个关键方法：
+        RNGPreloadInstance  -handleEnterBackground:
+        ALTCubeEventHandler -onContainerPause
+        ALTCubeEventHandler -onContainerViewDidDisappear
+    这三个就是小游戏页面"一进后台就把自己暂停"的入口。
+    把它们拦掉，页面根本不知道进了后台，倒计时继续走 —— 这正是用户最初要的效果，
+    而且比吞 scene 事件（v5/v6/v8 崩了三次）安全得多，因为它不改变系统状态。
+
+    另外 BeeVideoPlayerView 上有原厂的 -setEnableBackgroudPlay:（拼写就是 Backgroud），
+    一并打开，视频在后台不会被主动停。
+
+    配套：检测到播放器就自动把音频保活打开（发 Darwin 通知给浮窗），
+    否则进程被挂起，上面这些全白搭。
+
+    【面板变化】
+    第一行：导出TXT / 复制全文 / 抓界面 / 后台:开|关   ← 新增
+    第二行：秒过广告 / 自动:开|关 / JS加速:开|关
+    秒过链保留，多了一步 bg-prime（先让播放器允许后台播放）。
+
+    ===== 以下是 v14 的说明，保留备查 =====
+*/
+
+/*
     ===== 修改说明 v14（2026-10-21）加探针，不再瞎猜 =====
 
     【v13 报告的结果：注入成功，但打不中】
@@ -155,6 +191,7 @@
 */
 
 #import <objc/runtime.h>
+#import <notify.h>
 #import <objc/message.h>
 #import <UserNotifications/UserNotifications.h>
 #import <dlfcn.h>
@@ -333,7 +370,7 @@ static void reconCollectEnv(void) {
     }
 
     @synchronized (gEnvLines) {
-        [gEnvLines addObject:@"扫描器        : AdRecon v14（侦察 + 探针 + H5加速）"];
+        [gEnvLines addObject:@"扫描器        : AdRecon v15（后台续跑 + 秒过）"];
         [gEnvLines addObject:[NSString stringWithFormat:@"采集开始      : %@", [NSDate date]]];
         [gEnvLines addObject:[NSString stringWithFormat:@"iOS 版本      : %@", device.systemVersion]];
         [gEnvLines addObject:[NSString stringWithFormat:@"设备型号      : %@", reconSysctlString(@"hw.machine") ?: @"?"]];
@@ -1093,6 +1130,49 @@ static id hook_loadHTML(id self, SEL _cmd, id html, id baseURL) {
 /* 定义在广告秒过模块里 */
 static void adPiggybackSpeedScript(id controller);
 
+/* 定义在广告秒过模块里：后台续跑开关 */
+BOOL AdBgKeepEnabled(void);
+void AdPrimeBackgroundPlayback(void);
+void AdSetBgKeep(BOOL enabled);
+
+/*
+    v15：小游戏/小程序页面在进后台时会被这几个方法主动暂停。
+    把入口拦掉，页面自己就不知道进了后台，倒计时继续走。
+    配合音频保活（进程不被挂起）就是用户最初要的效果。
+*/
+static void (*orig_rngEnterBackground)(id, SEL, id);
+static void hook_rngEnterBackground(id self, SEL _cmd, id arg) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 RNGPreloadInstance -handleEnterBackground:（页面不会暂停）");
+        return;
+    }
+    if (orig_rngEnterBackground) {
+        orig_rngEnterBackground(self, _cmd, arg);
+    }
+}
+
+static void (*orig_cubePause)(id, SEL);
+static void hook_cubePause(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 %@ -onContainerPause（容器不暂停）", NSStringFromClass([self class]));
+        return;
+    }
+    if (orig_cubePause) {
+        orig_cubePause(self, _cmd);
+    }
+}
+
+static void (*orig_cubeDisappear)(id, SEL);
+static void hook_cubeDisappear(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 %@ -onContainerViewDidDisappear", NSStringFromClass([self class]));
+        return;
+    }
+    if (orig_cubeDisappear) {
+        orig_cubeDisappear(self, _cmd);
+    }
+}
+
 static void (*orig_addUserScript)(id, SEL, id);
 static void hook_addUserScript(id self, SEL _cmd, id script) {
     if (orig_addUserScript) {
@@ -1338,6 +1418,15 @@ static void reconInstallHooks(void) {
         reconLogF(@"[INIT] WebView 初始化 hook 异常：%@", e.reason ?: @"?");
     }
 
+    /* 后台续跑（v15）：拦住小游戏页面自己的"进后台就暂停" */
+    @try {
+        RECON_HOOK_I("RNGPreloadInstance", "handleEnterBackground:", hook_rngEnterBackground, orig_rngEnterBackground);
+        RECON_HOOK_I("ALTCubeEventHandler", "onContainerPause", hook_cubePause, orig_cubePause);
+        RECON_HOOK_I("ALTCubeEventHandler", "onContainerViewDidDisappear", hook_cubeDisappear, orig_cubeDisappear);
+    } @catch (NSException *e) {
+        reconLogF(@"[INIT] 后台续跑 hook 异常：%@", e.reason ?: @"?");
+    }
+
     if (!installed) {
         installed = YES;
         reconLogF(@"[INIT] hook 安装完成 · VC=%d 窗口=%d 标签=%d 定时器=%d 网络=%d 网页=%d 视频=%d",
@@ -1534,7 +1623,7 @@ static NSString *reconReportTextInternal(void) {
     NSMutableString *out = [NSMutableString string];
 
     [out appendString:@"================================================================\n"];
-    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v14）\n"];
+    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v15）\n"];
     [out appendString:@"   由注入版 dylib 自动生成，直接把这个文件发给元宝\n"];
     [out appendString:@"================================================================\n\n"];
 
@@ -1624,26 +1713,28 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"        Swift 内部符号、服务端下发的动态脚本。\n"];
     [out appendString:@"如果报告里一片空白，说明广告全在这些层面，需要换侦察手段。\n\n"];
 
-    [out appendString:@"【六、秒过能力（v14）】\n"];
-    [out appendString:@"静态分析自 AlipayWallet 12.12.30 的 __objc_methtype，签名已核对：\n"];
-    [out appendString:@"  AdOpenScreenView    -exitAd / -exiAdWhenTimeOver   零参数\n"];
-    [out appendString:@"  CountdownButton     -setRemainingTime:(double) + -updateCountdown\n"];
-    [out appendString:@"  AdRewardView        -countDownFinish               零参数\n"];
-    [out appendString:@"  AdRewardedVideoView -countDownEnd                  零参数\n"];
-    [out appendString:@"  BeeVideoPlayerView  -seekToTime:(double) / -getCurrentTime\n"];
-    [out appendString:@"执行顺序：①倒计时归零 ②视频快进 ③再快进 ④探针 ⑤激励结束\n"];
-    [out appendString:@"          ⑥激励视频结束 ⑦开屏时间到 ⑧开屏退出 ⑨H5补刀 ⑩H5自检\n"];
-    [out appendString:@"每步间隔 0.6 秒，广告一消失就跳过后续步骤。日志里搜 [KILL] 能看到过程。\n"];
-    [out appendString:@"H5 加速：文档期注入，只对 paladin/antgame/yuyan/prizeMachine/antfarm/\n"];
-    [out appendString:@"gameTaskSuspend/ad_mgr 生效；只加速 900~1100ms 和 90~110ms 的定时器，\n"];
-    [out appendString:@"其它间隔不动；Date.now 8 倍；120 秒后自动还原。\n"];
-    [out appendString:@"探针：[PROBE] 是在广告条位置做命中测试打出来的类名链，\n"];
-    [out appendString:@"      [CLASS] 是命中类的实例方法全表，用来定位计时逻辑。\n"];
-    [out appendString:@"自检：[H5·自检#n] 是页面里读回 speed=1 表示加速脚本确实跑了。\n\n"];
+    [out appendString:@"【六、能力清单（v15）】\n"];
+    [out appendString:@"A. 后台续跑（默认开，面板第一行「后台:开」）\n"];
+    [out appendString:@"   拦 RNGPreloadInstance -handleEnterBackground:\n"];
+    [out appendString:@"   拦 ALTCubeEventHandler -onContainerPause / -onContainerViewDidDisappear\n"];
+    [out appendString:@"   对 BeeVideoPlayerView 调 -setEnableBackgroudPlay:YES\n"];
+    [out appendString:@"   检测到播放器就自动开音频保活（否则进程被挂起，拦截没意义）\n"];
+    [out appendString:@"   日志搜 [BG] 能看到每一次拦截\n"];
+    [out appendString:@"B. 秒过（面板第二行「秒过广告」）\n"];
+    [out appendString:@"   静态分析自 AlipayWallet 12.12.30 的 __objc_methtype，签名已核对：\n"];
+    [out appendString:@"     AdOpenScreenView -exitAd / -exiAdWhenTimeOver   零参数\n"];
+    [out appendString:@"     CountdownButton  -setRemainingTime:(double) + -updateCountdown\n"];
+    [out appendString:@"     AdRewardView     -countDownFinish               零参数\n"];
+    [out appendString:@"     AdRewardedVideoView -countDownEnd               零参数\n"];
+    [out appendString:@"     BeeVideoPlayerView -seekToTime:(double) / -getCurrentTime\n"];
+    [out appendString:@"   顺序：①后台预热 ②倒计时归零 ③视频快进 ④再快进 ⑤探针 ⑥激励结束\n"];
+    [out appendString:@"         ⑦激励视频结束 ⑧开屏时间到 ⑨开屏退出 ⑩H5补刀 ⑪H5自检\n"];
+    [out appendString:@"探针：[PROBE] 广告条命中的类名链，[CLASS] 命中类的方法表。\n"];
+    [out appendString:@"自检：[H5·自检#n] 读回 speed=1 才说明加速脚本真跑了（v14 全是 0）。\n\n"];
 
     [out appendString:@"【七、生成信息】\n"];
     [out appendFormat:@"生成时间: %@\n", [NSDate date]];
-    [out appendFormat:@"插件版本: AdRecon v14\n"];
+    [out appendFormat:@"插件版本: AdRecon v15\n"];
     [out appendFormat:@"设备    : %@ / iOS %@\n",
      reconSysctlString(@"hw.machine") ?: @"?",
      [[UIDevice currentDevice] systemVersion]];
@@ -1674,7 +1765,7 @@ NSString *ReconWriteReportFile(void) {
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [formatter stringFromDate:[NSDate date]];
-    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v14-%@.txt", stamp];
+    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v15-%@.txt", stamp];
     NSString *path = [dir stringByAppendingPathComponent:fileName];
 
     NSError *error = nil;
@@ -1801,6 +1892,18 @@ static BOOL adCallD(id target, NSString *selName, double value) {
         return NO;
     }
     ((void (*)(id, SEL, double))objc_msgSend)(target, sel, value);
+    return YES;
+}
+
+static BOOL adCallB(id target, NSString *selName, BOOL value) {
+    if (target == nil) {
+        return NO;
+    }
+    SEL sel = NSSelectorFromString(selName);
+    if (![target respondsToSelector:sel]) {
+        return NO;
+    }
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(target, sel, value);
     return YES;
 }
 
@@ -2146,6 +2249,11 @@ static void adProbeTopBar(void) {
 
 static void adPerformStep(NSString *step) {
     @try {
+        if ([step isEqualToString:@"bg-prime"]) {
+            AdPrimeBackgroundPlayback();
+            return;
+        }
+
         if ([step isEqualToString:@"countdown-zero"]) {
             NSArray *buttons = adFindViews(@"CountdownButton");
             if (buttons.count == 0) {
@@ -2274,7 +2382,7 @@ void AdKillRun(NSString *reason) {
         return;
     }
 
-    NSArray<NSString *> *steps = @[@"countdown-zero", @"video-seek-end", @"video-seek-again",
+    NSArray<NSString *> *steps = @[@"bg-prime", @"countdown-zero", @"video-seek-end", @"video-seek-again",
                                    @"probe-ui", @"reward-finish", @"rewardvideo-end",
                                    @"openscreen-timeover", @"openscreen-exit",
                                    @"js-speed", @"h5-check"];
@@ -2310,6 +2418,60 @@ void AdSetAutoKill(BOOL enabled) {
         gAutoKillCount = 0;
     }
     reconLogF(@"[KILL] 自动秒过 %@", enabled ? @"已开启" : @"已关闭");
+}
+
+#pragma mark 后台续跑（v15）
+
+/* 默认开启：这是用户最初要的东西 —— 切后台，倒计时接着走 */
+BOOL AdBgKeepEnabled(void) {
+    NSNumber *value = [[NSUserDefaults standardUserDefaults] objectForKey:@"ad_bg_keep"];
+    return value == nil ? YES : value.boolValue;
+}
+
+void AdSetBgKeep(BOOL enabled) {
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:@"ad_bg_keep"];
+    reconLogF(@"[BG] 后台续跑 %@", enabled ? @"已开启（页面进后台不再暂停）" : @"已关闭");
+}
+
+/*
+    让播放器允许后台播放。
+    BeeVideoPlayerView 上有现成的 -setEnableBackgroudPlay:（原厂拼写就是 Backgroud），
+    开起来之后进后台视频不会被主动停。
+*/
+void AdPrimeBackgroundPlayback(void) {
+    if (!AdBgKeepEnabled()) {
+        return;
+    }
+    NSArray *players = adFindViews(@"BeeVideoPlayerView");
+    NSInteger ok = 0;
+    for (id player in players) {
+        if (adCallB(player, @"setEnableBackgroudPlay:", YES)) {
+            ok += 1;
+        }
+    }
+    reconLogF(@"[BG] 允许后台播放：%ld/%lu 个播放器", (long)ok, (unsigned long)players.count);
+
+    /* 通知浮窗把音频保活打开，否则进程被挂起，倒计时照样停 */
+    notify_post("com.sergy.immortalizerjailed.bgkeep");
+}
+
+static BOOL gBgPrimed = NO;
+
+static void adBgKeepTick(void) {
+    if (!AdBgKeepEnabled()) {
+        gBgPrimed = NO;
+        return;
+    }
+    NSInteger players = adCount(@"BeeVideoPlayerView");
+    if (players == 0) {
+        gBgPrimed = NO;
+        return;
+    }
+    if (gBgPrimed) {
+        return;
+    }
+    AdPrimeBackgroundPlayback();
+    gBgPrimed = YES;
 }
 
 /* 每秒巡检一次；只认三个明确的广告类，避免误杀支付页倒计时 */
@@ -2380,6 +2542,7 @@ static void setup() {
         [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
             (void)timer;
             adAutoKillTick();
+            adBgKeepTick();
         }];
         gInternalTimerGuard = NO;
 
