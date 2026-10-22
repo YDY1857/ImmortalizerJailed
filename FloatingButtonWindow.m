@@ -123,6 +123,9 @@ extern BOOL AdBgKeepEnabled(void);
 extern void AdSetBgKeep(BOOL enabled);
 extern void AdPrimeBackgroundPlayback(void);
 
+/* 由 main.m 提供：往同一份报告里写一行（v16） */
+extern void AdLog(NSString *message);
+
 @interface FloatingButtonWindow ()
 @property (nonatomic, strong) UIButton *floatingButton;
 @property (nonatomic, strong) UIView *handleView;
@@ -554,7 +557,7 @@ static NSData *makeInaudibleWav(void) {
         textView.font = mono ?: [UIFont systemFontOfSize:10.0];
 
         UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w - 120, 34)];
-        titleLabel.text = @"AdRecon v15 后台续跑 + 秒过";
+        titleLabel.text = @"AdRecon v16 后台续跑";
         titleLabel.textColor = [UIColor whiteColor];
         titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
 
@@ -664,6 +667,7 @@ static NSData *makeInaudibleWav(void) {
 /* 后台续跑必须配合音频保活，否则进程被挂起，倒计时照样停 */
 - (void)forceEnableKeepAlive {
     if (self.isImmortalized) {
+        AdLog(@"[BG] 音频保活已在运行，不重复开");
         return;
     }
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"immortalized"];
@@ -671,6 +675,9 @@ static NSData *makeInaudibleWav(void) {
     notify_post("com.sergy.immortalizerjailed.updateprefs");
     [self updateButtonColor];
     [self startTimer];
+
+    AdLog([NSString stringWithFormat:@"[BG] 自动打开音频保活 · audioOK=%d · %@",
+           self.audioOK ? 1 : 0, self.audioLastError ?: @"无错误"]);
 }
 
 - (void)bgKeepTapped {
@@ -825,22 +832,22 @@ static NSData *makeInaudibleWav(void) {
 
 - (NSString *)statusText {
     if (!self.isImmortalized) {
-        return @"v15 · 就绪（长按出面板）";
+        return @"v16 · 就绪（长按出面板）";
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v15 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v16 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v15 · 音频运行中";
+        return @"v16 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v15 · 音频未启动";
+        return @"v16 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v15 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v16 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）

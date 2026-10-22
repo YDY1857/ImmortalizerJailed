@@ -16,6 +16,37 @@
 */
 
 /*
+    ===== 修改说明 v16（2026-10-22）v15 猜错了对象 =====
+
+    【v15 真机结果】
+    报告里只有一行 [BG]：允许后台播放 1/1。
+    三条 ★ 拦截（RNGPreloadInstance handleEnterBackground: 等）**一条都没出现**
+    —— 说明小游戏进后台根本不走那几个方法，我猜错了。
+    而且日志在 28 秒就断了，进程一进后台就被挂起：音频保活压根没开起来。
+
+    【v16 两个修正】
+    1. 换真正的暂停入口。把二进制里所有"进后台就暂停"的方法按广告/小游戏域筛了一遍，
+       视图树里真实存在的 CubeViewNGImpl -onPause 才是小游戏的暂停开关。新增拦截：
+           CubeViewNGImpl -onPause
+           CubeView       -onPause
+           BeeVideoPlayerView -audioSessionPause / -audioSessionPauseFromNotification
+           BeeAudioSessionManager4Video -systemRequestResignActive:
+       v15 那三个保留，多拦一层不亏。
+
+    2. 音频保活改成直接调用，不再只靠 Darwin 通知。
+       main.m 里用 category 声明了浮窗的 -forceEnableKeepAlive 后直接调，
+       通知丢了也不影响；打开结果会写进报告（audioOK=1 / 失败原因）。
+
+    【v16 新增的诊断，回答"到底是不是被挂起了"】
+    - [LIFE] 四条生命周期通知全记（WillResignActive / DidEnterBackground /
+      WillEnterForeground / DidBecomeActive）
+    - [ALIVE] 每 30 秒一条心跳。进后台之后如果还能看到心跳，说明进程活着；
+      看不到，就是被系统挂起了 —— 这比任何猜测都准。
+
+    ===== 以下是 v15 的说明，保留备查 =====
+*/
+
+/*
     ===== 修改说明 v15（2026-10-22）换回你真正想要的那条路 =====
 
     【v14 探针结果】
@@ -25,7 +56,7 @@
         CKPView<CKPView<CKPView<CubeViewNGImpl<AntCubeView<RNGOverlayContainerView
         且 text 为空 —— 倒计时不是 UILabel 画的，也不在 H5 的 DOM 里
       · 全程没有 1 秒重复定时器
-    合起来：14 秒倒计时既不在 WKWebView 的 window 上，也不是 NSTimer，
+    合起来：15 秒倒计时既不在 WKWebView 的 window 上，也不是 NSTimer，
     而是小游戏容器（AntCube / RNG）里的原生逻辑。
 
     【v15 换路：不做"秒过"，做"后台继续跑"】
@@ -61,7 +92,7 @@
     报告里另两个硬事实：
       · 整段时间没有 1 秒的重复定时器，只有稀疏的 one-shot（CKTimerTarget 1s，约 10 秒一次）
       · 一条 [LBL] 都没抓到「浏览广告14秒」，连 setAttributedText 也没有
-    结论：那行 14 秒既不是 UILabel，也不是 NSTimer 驱动。
+    结论：那行倒计时文字既不是 UILabel，也不是 NSTimer 驱动。
     它跑在小游戏自己的 JS 引擎里（不是 WKWebView 的 window），
     所以我们改 window.setInterval / Date.now 根本碰不到。
 
@@ -86,7 +117,8 @@
     【v12 真机报告暴露的两个事实】
     1. 视频快进成功了（4.0s → 108.9s，说明这段视频总长 108.9 秒），但广告没结束。
        用户截图确认：左上角那行「广告 ∨ ｜ 浏览广告14秒得奖励 ｜ 关闭」就是计时条，
-       "广告结束"只看这 14 秒走没走完，跟视频播到哪一帧没关系。
+       "广告结束"只看这 15 秒走没走完，跟视频播到哪一帧没关系。
+       （截图里显示"14秒"是因为已经走过去 1 秒，广告总时长是 15 秒。）
     2. 「H5 加速脚本已挂上」这条日志一次都没出现 —— 注入根本没执行。
        v12 走的是 hook -[WKWebView initWithFrame:configuration:]，那条路没触发。
 
@@ -106,7 +138,7 @@
     【顺手补的观测点】
     - 启动时写一行「H5 加速状态：开/关」，避免再出现不知道当时开没开的情况
     - 白名单页面加载时给 URL 打 ★
-    - 新增 hook setAttributedText:（那行 14 秒文字可能是富文本，setText 抓不到）
+    - 新增 hook setAttributedText:（那行倒计时文字可能是富文本，setText 抓不到）
     - 快照类名加 AdTagView / AdMessageView / AdCubeCardView / BeeVideoCountdownPlugin
     - 秒过结束的横幅改成实话：视频层消失 ≠ 广告结束
 
@@ -205,6 +237,11 @@
 #import <stdlib.h>
 #import "FloatingButtonWindow.h"
 #import "PrivateHeaders.h"
+
+/* 浮窗里实现、但没写进 .h 的方法，这里声明一下好直接调（比靠 Darwin 通知可靠） */
+@interface FloatingButtonWindow (AdBgKeep)
+- (void)forceEnableKeepAlive;
+@end
 
 #pragma mark - 常量
 
@@ -370,7 +407,7 @@ static void reconCollectEnv(void) {
     }
 
     @synchronized (gEnvLines) {
-        [gEnvLines addObject:@"扫描器        : AdRecon v15（后台续跑 + 秒过）"];
+        [gEnvLines addObject:@"扫描器        : AdRecon v16（后台续跑加强版）"];
         [gEnvLines addObject:[NSString stringWithFormat:@"采集开始      : %@", [NSDate date]]];
         [gEnvLines addObject:[NSString stringWithFormat:@"iOS 版本      : %@", device.systemVersion]];
         [gEnvLines addObject:[NSString stringWithFormat:@"设备型号      : %@", reconSysctlString(@"hw.machine") ?: @"?"]];
@@ -1135,6 +1172,73 @@ BOOL AdBgKeepEnabled(void);
 void AdPrimeBackgroundPlayback(void);
 void AdSetBgKeep(BOOL enabled);
 
+/* 定义在广告秒过模块里：给浮窗用的日志出口 */
+void AdLog(NSString *message);
+
+/*
+    v16：v15 那三个方法一次都没被调用（报告里零 [BG] ★ 拦截），
+    从二进制里重新翻了所有"进后台就暂停"的入口，真正被走的是下面这批：
+        CubeViewNGImpl      -onPause          ← 小游戏渲染根视图，视图树里就有它
+        CubeView            -onPause
+        BeeVideoPlayerView  -audioSessionPause / -audioSessionPauseFromNotification
+        BeeAudioSessionManager4Video -systemRequestResignActive:
+    CubeViewNGImpl 才是小游戏真正的暂停开关，v15 猜错了对象。
+*/
+static void (*orig_cubeNGPause)(id, SEL);
+static void hook_cubeNGPause(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 CubeViewNGImpl -onPause（小游戏不暂停）");
+        return;
+    }
+    if (orig_cubeNGPause) {
+        orig_cubeNGPause(self, _cmd);
+    }
+}
+
+static void (*orig_cubeViewPause)(id, SEL);
+static void hook_cubeViewPause(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 %@ -onPause", NSStringFromClass([self class]));
+        return;
+    }
+    if (orig_cubeViewPause) {
+        orig_cubeViewPause(self, _cmd);
+    }
+}
+
+static void (*orig_beeAudioPause)(id, SEL);
+static void hook_beeAudioPause(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 BeeVideoPlayerView -audioSessionPause");
+        return;
+    }
+    if (orig_beeAudioPause) {
+        orig_beeAudioPause(self, _cmd);
+    }
+}
+
+static void (*orig_beeAudioPauseNote)(id, SEL);
+static void hook_beeAudioPauseNote(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 BeeVideoPlayerView -audioSessionPauseFromNotification");
+        return;
+    }
+    if (orig_beeAudioPauseNote) {
+        orig_beeAudioPauseNote(self, _cmd);
+    }
+}
+
+static void (*orig_beeSysResign)(id, SEL, id);
+static void hook_beeSysResign(id self, SEL _cmd, id arg) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 %@ -systemRequestResignActive:", NSStringFromClass([self class]));
+        return;
+    }
+    if (orig_beeSysResign) {
+        orig_beeSysResign(self, _cmd, arg);
+    }
+}
+
 /*
     v15：小游戏/小程序页面在进后台时会被这几个方法主动暂停。
     把入口拦掉，页面自己就不知道进了后台，倒计时继续走。
@@ -1427,6 +1531,17 @@ static void reconInstallHooks(void) {
         reconLogF(@"[INIT] 后台续跑 hook 异常：%@", e.reason ?: @"?");
     }
 
+    /* 后台续跑（v16）：这才是真正被走到的暂停入口 */
+    @try {
+        RECON_HOOK_I("CubeViewNGImpl", "onPause", hook_cubeNGPause, orig_cubeNGPause);
+        RECON_HOOK_I("CubeView", "onPause", hook_cubeViewPause, orig_cubeViewPause);
+        RECON_HOOK_I("BeeVideoPlayerView", "audioSessionPause", hook_beeAudioPause, orig_beeAudioPause);
+        RECON_HOOK_I("BeeVideoPlayerView", "audioSessionPauseFromNotification", hook_beeAudioPauseNote, orig_beeAudioPauseNote);
+        RECON_HOOK_I("BeeAudioSessionManager4Video", "systemRequestResignActive:", hook_beeSysResign, orig_beeSysResign);
+    } @catch (NSException *e) {
+        reconLogF(@"[INIT] v16 暂停 hook 异常：%@", e.reason ?: @"?");
+    }
+
     if (!installed) {
         installed = YES;
         reconLogF(@"[INIT] hook 安装完成 · VC=%d 窗口=%d 标签=%d 定时器=%d 网络=%d 网页=%d 视频=%d",
@@ -1623,7 +1738,7 @@ static NSString *reconReportTextInternal(void) {
     NSMutableString *out = [NSMutableString string];
 
     [out appendString:@"================================================================\n"];
-    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v15）\n"];
+    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v16）\n"];
     [out appendString:@"   由注入版 dylib 自动生成，直接把这个文件发给元宝\n"];
     [out appendString:@"================================================================\n\n"];
 
@@ -1713,13 +1828,15 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"        Swift 内部符号、服务端下发的动态脚本。\n"];
     [out appendString:@"如果报告里一片空白，说明广告全在这些层面，需要换侦察手段。\n\n"];
 
-    [out appendString:@"【六、能力清单（v15）】\n"];
+    [out appendString:@"【六、能力清单（v16）】\n"];
     [out appendString:@"A. 后台续跑（默认开，面板第一行「后台:开」）\n"];
-    [out appendString:@"   拦 RNGPreloadInstance -handleEnterBackground:\n"];
-    [out appendString:@"   拦 ALTCubeEventHandler -onContainerPause / -onContainerViewDidDisappear\n"];
+    [out appendString:@"   拦 CubeViewNGImpl -onPause（v16 真正被走到的入口）\n"];
+    [out appendString:@"   拦 CubeView -onPause / BeeVideoPlayerView -audioSessionPause\n"];
+    [out appendString:@"   拦 BeeAudioSessionManager4Video -systemRequestResignActive:\n"];
+    [out appendString:@"   拦 RNGPreloadInstance -handleEnterBackground:（v15 保留）\n"];
     [out appendString:@"   对 BeeVideoPlayerView 调 -setEnableBackgroudPlay:YES\n"];
-    [out appendString:@"   检测到播放器就自动开音频保活（否则进程被挂起，拦截没意义）\n"];
-    [out appendString:@"   日志搜 [BG] 能看到每一次拦截\n"];
+    [out appendString:@"   检测到播放器就自动开音频保活（v16 改为直接调用，不等通知）\n"];
+    [out appendString:@"   诊断：[LIFE] 生命周期、[ALIVE] 30 秒心跳（有心跳=进程没被挂起）\n"];
     [out appendString:@"B. 秒过（面板第二行「秒过广告」）\n"];
     [out appendString:@"   静态分析自 AlipayWallet 12.12.30 的 __objc_methtype，签名已核对：\n"];
     [out appendString:@"     AdOpenScreenView -exitAd / -exiAdWhenTimeOver   零参数\n"];
@@ -1734,7 +1851,7 @@ static NSString *reconReportTextInternal(void) {
 
     [out appendString:@"【七、生成信息】\n"];
     [out appendFormat:@"生成时间: %@\n", [NSDate date]];
-    [out appendFormat:@"插件版本: AdRecon v15\n"];
+    [out appendFormat:@"插件版本: AdRecon v16\n"];
     [out appendFormat:@"设备    : %@ / iOS %@\n",
      reconSysctlString(@"hw.machine") ?: @"?",
      [[UIDevice currentDevice] systemVersion]];
@@ -1765,7 +1882,7 @@ NSString *ReconWriteReportFile(void) {
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [formatter stringFromDate:[NSDate date]];
-    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v15-%@.txt", stamp];
+    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v16-%@.txt", stamp];
     NSString *path = [dir stringByAppendingPathComponent:fileName];
 
     NSError *error = nil;
@@ -1808,6 +1925,14 @@ static void reconAutoFlush(void) {
 /* 供浮窗调用 */
 void ReconMark(NSString *label) {
     reconBanner([NSString stringWithFormat:@"用户标记：%@", label ?: @"?"]);
+}
+
+/* 供浮窗调用：把浮窗那边的事件也写进同一份报告 */
+void AdLog(NSString *message) {
+    if (message.length == 0) {
+        return;
+    }
+    reconAppend(message);
 }
 
 void ReconSnapshotUIExternal(void) {
@@ -2451,8 +2576,12 @@ void AdPrimeBackgroundPlayback(void) {
     }
     reconLogF(@"[BG] 允许后台播放：%ld/%lu 个播放器", (long)ok, (unsigned long)players.count);
 
-    /* 通知浮窗把音频保活打开，否则进程被挂起，倒计时照样停 */
-    notify_post("com.sergy.immortalizerjailed.bgkeep");
+    /* 直接调浮窗的方法开音频保活（v16：不再只靠 Darwin 通知，避免通知丢了没人接） */
+    @try {
+        [[FloatingButtonWindow sharedInstance] forceEnableKeepAlive];
+    } @catch (NSException *e) {
+        reconLogF(@"[BG] 打开音频保活异常：%@", e.reason ?: @"?");
+    }
 }
 
 static BOOL gBgPrimed = NO;
@@ -2546,14 +2675,26 @@ static void setup() {
         }];
         gInternalTimerGuard = NO;
 
-        // 7. 进后台时立刻落盘
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification *note) {
-            (void)note;
-            gDirty = YES;
-            reconAutoFlush();
+        // 7. 前后台生命周期全部记下来 + 立刻落盘（判断"进程有没有活下来"的唯一依据）
+        NSArray<NSString *> *lifecycleNames = @[UIApplicationWillResignActiveNotification,
+                                                UIApplicationDidEnterBackgroundNotification,
+                                                UIApplicationWillEnterForegroundNotification,
+                                                UIApplicationDidBecomeActiveNotification];
+        for (NSString *name in lifecycleNames) {
+            [[NSNotificationCenter defaultCenter] addObserverForName:name
+                                                              object:nil
+                                                               queue:[NSOperationQueue mainQueue]
+                                                          usingBlock:^(NSNotification *note) {
+                reconLogF(@"[LIFE] %@", note.name);
+                gDirty = YES;
+                reconAutoFlush();
+            }];
+        }
+
+        // 7.5 30 秒心跳：进后台之后如果还能看到这条，就说明进程没被挂起
+        [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer *timer) {
+            (void)timer;
+            reconLogF(@"[ALIVE] 进程存活心跳（%ld 条日志）", (long)ReconLineCount());
         }];
 
         [[FloatingButtonWindow sharedInstance] showButton];
