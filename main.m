@@ -441,7 +441,7 @@ static void reconCollectEnv(void) {
     }
 
     @synchronized (gEnvLines) {
-        [gEnvLines addObject:@"扫描器        : AdRecon v17（延迟补挂版）"];
+        [gEnvLines addObject:@"扫描器        : AdRecon v18（播放器看门狗版）"];
         [gEnvLines addObject:[NSString stringWithFormat:@"采集开始      : %@", [NSDate date]]];
         [gEnvLines addObject:[NSString stringWithFormat:@"iOS 版本      : %@", device.systemVersion]];
         [gEnvLines addObject:[NSString stringWithFormat:@"设备型号      : %@", reconSysctlString(@"hw.machine") ?: @"?"]];
@@ -1274,6 +1274,50 @@ static void hook_beeSysResign(id self, SEL _cmd, id arg) {
 }
 
 /*
+    v18：v17 拦截成功了、JS 泵也在跑，倒计时还是不动
+    → 说明它跟着"播放进度"走。视频进后台被暂停，计时自然停。
+    所以这一版直接盯住播放器：
+      -pause / -innerPause 只在后台期间拦掉（前台用户自己点暂停不受影响）
+      -checkAppState 只记录，看它是不是在查应用状态
+*/
+static BOOL gAppInBackground = NO;
+static void (*orig_beePause)(id, SEL);
+static void hook_beePause(id self, SEL _cmd) {
+    if (gAppInBackground && AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 BeeVideoPlayerView -pause（后台不让停）");
+        return;
+    }
+    if (orig_beePause) {
+        orig_beePause(self, _cmd);
+    }
+}
+
+static void (*orig_beeInnerPause)(id, SEL);
+static void hook_beeInnerPause(id self, SEL _cmd) {
+    if (gAppInBackground && AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 BeeVideoPlayerView -innerPause（后台不让停）");
+        return;
+    }
+    if (orig_beeInnerPause) {
+        orig_beeInnerPause(self, _cmd);
+    }
+}
+
+static void (*orig_beeCheckAppState)(id, SEL);
+static void hook_beeCheckAppState(id self, SEL _cmd) {
+    @try {
+        if (reconAllow(@"vid:checkAppState", 5.0)) {
+            reconLogF(@"[VID] BeeVideoPlayerView -checkAppState（播放器在查应用状态）");
+        }
+    } @catch (NSException *e) {
+        (void)e;
+    }
+    if (orig_beeCheckAppState) {
+        orig_beeCheckAppState(self, _cmd);
+    }
+}
+
+/*
     v15：小游戏/小程序页面在进后台时会被这几个方法主动暂停。
     把入口拦掉，页面自己就不知道进了后台，倒计时继续走。
     配合音频保活（进程不被挂起）就是用户最初要的效果。
@@ -1414,11 +1458,11 @@ static void hook_nbTimerHandle(id self, SEL _cmd, id timer) {
     }
 }
 
-/* 当前是否在后台（由 [LIFE] 生命周期观察者维护） */
-static BOOL gAppInBackground = NO;
+/* 当前是否在后台（由 [LIFE] 生命周期观察者维护），声明在本文件靠前处 */
 
 /*
-    探针二：[INVAL] 谁把定时器失效了。    只记 target 名字里带 TimerProxy / CKTimer / Render / Cube / NB 的，避免刷屏。
+    探针二：[INVAL] 谁把定时器失效了。
+    只记 target 名字里带 TimerProxy / CKTimer / Render / Cube / NB 的，避免刷屏。
     NSTimer 的真实实例是 __NSCFTimer（类簇），所以两个类都要挂。
 */
 static void reconNoteTimerInvalidate(id timer) {
@@ -1755,6 +1799,9 @@ static void reconInstallDeferredHooks(void) {
     reconTryHookOnce(@"BeeVideoPlayerView", @"audioSessionPause", (IMP)hook_beeAudioPause, (void **)&orig_beeAudioPause);
     reconTryHookOnce(@"BeeVideoPlayerView", @"audioSessionPauseFromNotification", (IMP)hook_beeAudioPauseNote, (void **)&orig_beeAudioPauseNote);
     reconTryHookOnce(@"BeeAudioSessionManager4Video", @"systemRequestResignActive:", (IMP)hook_beeSysResign, (void **)&orig_beeSysResign);
+    reconTryHookOnce(@"BeeVideoPlayerView", @"pause", (IMP)hook_beePause, (void **)&orig_beePause);
+    reconTryHookOnce(@"BeeVideoPlayerView", @"innerPause", (IMP)hook_beeInnerPause, (void **)&orig_beeInnerPause);
+    reconTryHookOnce(@"BeeVideoPlayerView", @"checkAppState", (IMP)hook_beeCheckAppState, (void **)&orig_beeCheckAppState);
 
     /* 两个探针 */
     reconTryHookOnce(@"NBComponentTimerProxy", @"handleTimer:", (IMP)hook_nbTimerHandle, (void **)&orig_nbTimerHandle);
@@ -1762,11 +1809,11 @@ static void reconInstallDeferredHooks(void) {
     reconTryHookOnce(@"__NSCFTimer", @"invalidate", (IMP)hook_timerInvalidate2, (void **)&orig_timerInvalidate2);
 
     if (gDeferredRounds == 1) {
-        reconLogF(@"[HOOK] 第 1 轮补挂：已装 %lu/19（没装上的等类加载后自动补）",
+        reconLogF(@"[HOOK] 第 1 轮补挂：已装 %lu/22（没装上的等类加载后自动补）",
                   (unsigned long)gDeferredDone.count);
-    } else if (!gDeferredAllLogged && gDeferredDone.count >= 19) {
+    } else if (!gDeferredAllLogged && gDeferredDone.count >= 22) {
         gDeferredAllLogged = YES;
-        reconLogF(@"[HOOK] ★ 19 个补挂全部完成（第 %d 轮）", gDeferredRounds);
+        reconLogF(@"[HOOK] ★ 22 个补挂全部完成（第 %d 轮）", gDeferredRounds);
     }
 }
 
@@ -2023,7 +2070,7 @@ static NSString *reconReportTextInternal(void) {
     NSMutableString *out = [NSMutableString string];
 
     [out appendString:@"================================================================\n"];
-    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v17）\n"];
+    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v18）\n"];
     [out appendString:@"   由注入版 dylib 自动生成，直接把这个文件发给元宝\n"];
     [out appendString:@"================================================================\n\n"];
 
@@ -2113,7 +2160,7 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"        Swift 内部符号、服务端下发的动态脚本。\n"];
     [out appendString:@"如果报告里一片空白，说明广告全在这些层面，需要换侦察手段。\n\n"];
 
-    [out appendString:@"【六、能力清单（v17）】\n"];
+    [out appendString:@"【六、能力清单（v18）】\n"];
     [out appendString:@"A. 后台续跑（默认开，面板第一行「后台:开」）\n"];
     [out appendString:@"   v17 修正：v16 的 hook 一次都没装上 —— 启动第 3 秒 Cube/Nebula/Bee 这些类\n"];
     [out appendString:@"   还没被 dyld 加载，objc_getClass 返回 NULL，宏静默跳过。\n"];
@@ -2121,11 +2168,18 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"   拦 NBComponentManager   -componentPause（Nebula 组件总开关）\n"];
     [out appendString:@"   拦 NBComponentManagerV2 -componentPause\n"];
     [out appendString:@"   拦 TinyAppConfigImpl    -onPauseTinyApp:（小程序层）\n"];
+    [out appendString:@"   拦 PLDContainer / PLDJITContainer -onHide（Paladin 容器层）\n"];
     [out appendString:@"   拦 CubeViewNGImpl / CubeView -onPause（渲染层）\n"];
     [out appendString:@"   拦 BeeVideoPlayerView -audioSessionPause / -audioSessionPauseFromNotification\n"];
     [out appendString:@"   拦 BeeAudioSessionManager4Video -systemRequestResignActive:\n"];
     [out appendString:@"   拦 RNGPreloadInstance -handleEnterBackground:\n"];
     [out appendString:@"   只观察不拦：componentDidRecivePauseOrResume:scene:（暂停/恢复成对，乱吞会错乱）\n"];
+    [out appendString:@"D. v18 新增：播放器看门狗（针对\"倒计时跟着播放进度走\"）\n"];
+    [out appendString:@"   拦 BeeVideoPlayerView -pause / -innerPause（只在后台期间拦，前台手动暂停不受影响）\n"];
+    [out appendString:@"   观察 -checkAppState（播放器在查应用状态就会被记下来）\n"];
+    [out appendString:@"   [VID] 后台每秒看一次播放器：isPlaying 和当前播放位置。\n"];
+    [out appendString:@"         位置在涨 = 视频还在播，倒计时却不走 → 计时与播放无关，另找；\n"];
+    [out appendString:@"         位置不动 = 视频被暂停，这就是原因，看门狗会自动重新 play。\n"];
     [out appendString:@"B. 两个新探针\n"];
     [out appendString:@"   [TICK] 每 5 秒报一次 Nebula 定时泵活动量。后台还在涨=JS 泵没停（卡的是渲染）；\n"];
     [out appendString:@"          不涨=泵本身被停了，那就继续往上层找。\n"];
@@ -2139,7 +2193,7 @@ static NSString *reconReportTextInternal(void) {
 
     [out appendString:@"【七、生成信息】\n"];
     [out appendFormat:@"生成时间: %@\n", [NSDate date]];
-    [out appendFormat:@"插件版本: AdRecon v17\n"];
+    [out appendFormat:@"插件版本: AdRecon v18\n"];
     [out appendFormat:@"设备    : %@ / iOS %@\n",
      reconSysctlString(@"hw.machine") ?: @"?",
      [[UIDevice currentDevice] systemVersion]];
@@ -2170,7 +2224,7 @@ NSString *ReconWriteReportFile(void) {
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [formatter stringFromDate:[NSDate date]];
-    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v17-%@.txt", stamp];
+    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v18-%@.txt", stamp];
     NSString *path = [dir stringByAppendingPathComponent:fileName];
 
     NSError *error = nil;
@@ -2329,6 +2383,48 @@ static double adCallRetD(id target, NSString *selName) {
         return 0;
     }
     return ((double (*)(id, SEL))objc_msgSend)(target, sel);
+}
+
+static BOOL adCallRetB(id target, NSString *selName) {
+    if (target == nil) {
+        return NO;
+    }
+    SEL sel = NSSelectorFromString(selName);
+    if (![target respondsToSelector:sel]) {
+        return NO;
+    }
+    return ((BOOL (*)(id, SEL))objc_msgSend)(target, sel);
+}
+
+/*
+    v18 后台看门狗：每秒看一眼广告播放器。
+    - 报 isPlaying 和当前播放位置 → 判断"倒计时是不是跟着播放进度走"
+    - 后台里发现停了就重新 play
+*/
+static void adKeepVideoAlive(void) {
+    if (!gAppInBackground || !AdBgKeepEnabled()) {
+        return;
+    }
+    NSArray *players = adFindViews(@"BeeVideoPlayerView");
+    if (players.count == 0) {
+        if (reconAllow(@"vid:none", 10.0)) {
+            reconLogF(@"[VID] 后台视图树里没找到 BeeVideoPlayerView");
+        }
+        return;
+    }
+    for (id player in players) {
+        BOOL playing = adCallRetB(player, @"isPlaying");
+        double now = adCallRetD(player, @"getCurrentTime");
+        if (reconAllow(@"vid:alive", 5.0)) {
+            reconLogF(@"[VID] 后台播放器 isPlaying=%d 当前=%.1fs", playing ? 1 : 0, now);
+        }
+        if (!playing) {
+            BOOL ok = adCall(player, @"play");
+            if (reconAllow(@"vid:replay", 5.0)) {
+                reconLogF(@"[VID] 播放器在后台停住了，重新 play=%@", ok ? @"OK" : @"NO");
+            }
+        }
+    }
 }
 
 static NSString *adSnapshotState(void) {
@@ -2960,6 +3056,7 @@ static void setup() {
             (void)timer;
             adAutoKillTick();
             adBgKeepTick();
+            adKeepVideoAlive();
         }];
 
         // 6.6 v17 延迟补挂：Cube/Nebula/Bee 这些类要等小程序框架加载后才存在，

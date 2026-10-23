@@ -557,7 +557,7 @@ static NSData *makeInaudibleWav(void) {
         textView.font = mono ?: [UIFont systemFontOfSize:10.0];
 
         UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w - 120, 34)];
-        titleLabel.text = @"AdRecon v17 后台续跑";
+        titleLabel.text = @"AdRecon v18 后台续跑";
         titleLabel.textColor = [UIColor whiteColor];
         titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
 
@@ -832,22 +832,22 @@ static NSData *makeInaudibleWav(void) {
 
 - (NSString *)statusText {
     if (!self.isImmortalized) {
-        return @"v17 · 就绪（长按出面板）";
+        return @"v18 · 就绪（长按出面板）";
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v17 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v18 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v17 · 音频运行中";
+        return @"v18 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v17 · 音频未启动";
+        return @"v18 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v17 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v18 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）
