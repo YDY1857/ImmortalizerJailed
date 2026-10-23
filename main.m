@@ -441,7 +441,7 @@ static void reconCollectEnv(void) {
     }
 
     @synchronized (gEnvLines) {
-        [gEnvLines addObject:@"扫描器        : AdRecon v18（播放器看门狗版）"];
+        [gEnvLines addObject:@"扫描器        : AdRecon v19（强制续播版）"];
         [gEnvLines addObject:[NSString stringWithFormat:@"采集开始      : %@", [NSDate date]]];
         [gEnvLines addObject:[NSString stringWithFormat:@"iOS 版本      : %@", device.systemVersion]];
         [gEnvLines addObject:[NSString stringWithFormat:@"设备型号      : %@", reconSysctlString(@"hw.machine") ?: @"?"]];
@@ -1305,6 +1305,14 @@ static void hook_beeInnerPause(id self, SEL _cmd) {
 
 static void (*orig_beeCheckAppState)(id, SEL);
 static void hook_beeCheckAppState(id self, SEL _cmd) {
+    /* v19：v18 报告里后台期间它被调了 3 次，之后视频就卡在 13.2s 不动了。
+       它就是那个"后台了，把播放器按停"的执行者，后台期间直接不让它跑。 */
+    if (gAppInBackground && AdBgKeepEnabled()) {
+        if (reconAllow(@"vid:checkAppState:blocked", 5.0)) {
+            reconLogF(@"[BG] ★ 拦截 BeeVideoPlayerView -checkAppState（后台不查状态，免得它自己去暂停）");
+        }
+        return;
+    }
     @try {
         if (reconAllow(@"vid:checkAppState", 5.0)) {
             reconLogF(@"[VID] BeeVideoPlayerView -checkAppState（播放器在查应用状态）");
@@ -2070,7 +2078,7 @@ static NSString *reconReportTextInternal(void) {
     NSMutableString *out = [NSMutableString string];
 
     [out appendString:@"================================================================\n"];
-    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v18）\n"];
+    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v19）\n"];
     [out appendString:@"   由注入版 dylib 自动生成，直接把这个文件发给元宝\n"];
     [out appendString:@"================================================================\n\n"];
 
@@ -2160,7 +2168,7 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"        Swift 内部符号、服务端下发的动态脚本。\n"];
     [out appendString:@"如果报告里一片空白，说明广告全在这些层面，需要换侦察手段。\n\n"];
 
-    [out appendString:@"【六、能力清单（v18）】\n"];
+    [out appendString:@"【六、能力清单（v19）】\n"];
     [out appendString:@"A. 后台续跑（默认开，面板第一行「后台:开」）\n"];
     [out appendString:@"   v17 修正：v16 的 hook 一次都没装上 —— 启动第 3 秒 Cube/Nebula/Bee 这些类\n"];
     [out appendString:@"   还没被 dyld 加载，objc_getClass 返回 NULL，宏静默跳过。\n"];
@@ -2178,8 +2186,11 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"   拦 BeeVideoPlayerView -pause / -innerPause（只在后台期间拦，前台手动暂停不受影响）\n"];
     [out appendString:@"   观察 -checkAppState（播放器在查应用状态就会被记下来）\n"];
     [out appendString:@"   [VID] 后台每秒看一次播放器：isPlaying 和当前播放位置。\n"];
-    [out appendString:@"         位置在涨 = 视频还在播，倒计时却不走 → 计时与播放无关，另找；\n"];
-    [out appendString:@"         位置不动 = 视频被暂停，这就是原因，看门狗会自动重新 play。\n"];
+    [out appendString:@"         v19 修正：isPlaying 是假状态（报告里 =1 但位置卡死在 13.2s），\n"];
+    [out appendString:@"         所以改成看「位置有没有动」，连停 2 次就强制拉起：\n"];
+    [out appendString:@"         setEnableBackgroudPlay:YES → play → innerPlay → audioSessionResume\n"];
+    [out appendString:@"   v19 还拦住了 -checkAppState：v18 后台期间它被调 3 次，之后就卡住不动，\n"];
+    [out appendString:@"         它就是那个把播放器按停的执行者。\n"];
     [out appendString:@"B. 两个新探针\n"];
     [out appendString:@"   [TICK] 每 5 秒报一次 Nebula 定时泵活动量。后台还在涨=JS 泵没停（卡的是渲染）；\n"];
     [out appendString:@"          不涨=泵本身被停了，那就继续往上层找。\n"];
@@ -2193,7 +2204,7 @@ static NSString *reconReportTextInternal(void) {
 
     [out appendString:@"【七、生成信息】\n"];
     [out appendFormat:@"生成时间: %@\n", [NSDate date]];
-    [out appendFormat:@"插件版本: AdRecon v18\n"];
+    [out appendFormat:@"插件版本: AdRecon v19\n"];
     [out appendFormat:@"设备    : %@ / iOS %@\n",
      reconSysctlString(@"hw.machine") ?: @"?",
      [[UIDevice currentDevice] systemVersion]];
@@ -2224,7 +2235,7 @@ NSString *ReconWriteReportFile(void) {
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [formatter stringFromDate:[NSDate date]];
-    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v18-%@.txt", stamp];
+    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v19-%@.txt", stamp];
     NSString *path = [dir stringByAppendingPathComponent:fileName];
 
     NSError *error = nil;
@@ -2398,9 +2409,13 @@ static BOOL adCallRetB(id target, NSString *selName) {
 
 /*
     v18 后台看门狗：每秒看一眼广告播放器。
-    - 报 isPlaying 和当前播放位置 → 判断"倒计时是不是跟着播放进度走"
-    - 后台里发现停了就重新 play
+    v19 修正：v18 只按 isPlaying 判断，可这个值是假的 —— 报告里 isPlaying=1
+    但播放位置卡在 13.2s 一直不动。所以改成"看位置有没有动"，
+    连续两次不动就强制重新拉起（play + innerPlay + 放开后台播放）。
 */
+static double gLastVidTime = -1;
+static int gVidStallTicks = 0;
+
 static void adKeepVideoAlive(void) {
     if (!gAppInBackground || !AdBgKeepEnabled()) {
         return;
@@ -2415,13 +2430,29 @@ static void adKeepVideoAlive(void) {
     for (id player in players) {
         BOOL playing = adCallRetB(player, @"isPlaying");
         double now = adCallRetD(player, @"getCurrentTime");
-        if (reconAllow(@"vid:alive", 5.0)) {
-            reconLogF(@"[VID] 后台播放器 isPlaying=%d 当前=%.1fs", playing ? 1 : 0, now);
+
+        double diff = now - gLastVidTime;
+        if (diff < 0) {
+            diff = -diff;
         }
-        if (!playing) {
-            BOOL ok = adCall(player, @"play");
-            if (reconAllow(@"vid:replay", 5.0)) {
-                reconLogF(@"[VID] 播放器在后台停住了，重新 play=%@", ok ? @"OK" : @"NO");
+        BOOL stalled = (gLastVidTime >= 0 && diff < 0.05);
+        gVidStallTicks = stalled ? (gVidStallTicks + 1) : 0;
+        gLastVidTime = now;
+
+        if (reconAllow(@"vid:alive", 5.0)) {
+            reconLogF(@"[VID] 后台 isPlaying=%d 当前=%.1fs（连停 %d 次）",
+                      playing ? 1 : 0, now, gVidStallTicks);
+        }
+
+        if (!playing || gVidStallTicks >= 2) {
+            adCallB(player, @"setEnableBackgroudPlay:", YES);
+            BOOL ok1 = adCall(player, @"play");
+            BOOL ok2 = adCall(player, @"innerPlay");
+            adCall(player, @"audioSessionResume");
+            gVidStallTicks = 0;
+            if (reconAllow(@"vid:replay", 3.0)) {
+                reconLogF(@"[VID] 位置没动（%.1fs），强制拉起 play=%@ innerPlay=%@",
+                          now, ok1 ? @"OK" : @"NO", ok2 ? @"OK" : @"NO");
             }
         }
     }
@@ -3090,8 +3121,11 @@ static void setup() {
                 if ([note.name isEqualToString:UIApplicationWillResignActiveNotification] ||
                     [note.name isEqualToString:UIApplicationDidEnterBackgroundNotification]) {
                     gAppInBackground = YES;
+                    gVidStallTicks = 0;
                 } else {
                     gAppInBackground = NO;
+                    gLastVidTime = -1;
+                    gVidStallTicks = 0;
                     reconLogF(@"[TICK] 回到前台，Nebula 定时泵累计 %d 次", gNbTickCount);
                 }
                 gDirty = YES;
