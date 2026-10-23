@@ -441,7 +441,7 @@ static void reconCollectEnv(void) {
     }
 
     @synchronized (gEnvLines) {
-        [gEnvLines addObject:@"扫描器        : AdRecon v19（强制续播版）"];
+        [gEnvLines addObject:@"扫描器        : AdRecon v20（前台快进版）"];
         [gEnvLines addObject:[NSString stringWithFormat:@"采集开始      : %@", [NSDate date]]];
         [gEnvLines addObject:[NSString stringWithFormat:@"iOS 版本      : %@", device.systemVersion]];
         [gEnvLines addObject:[NSString stringWithFormat:@"设备型号      : %@", reconSysctlString(@"hw.machine") ?: @"?"]];
@@ -2078,7 +2078,7 @@ static NSString *reconReportTextInternal(void) {
     NSMutableString *out = [NSMutableString string];
 
     [out appendString:@"================================================================\n"];
-    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v19）\n"];
+    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v20）\n"];
     [out appendString:@"   由注入版 dylib 自动生成，直接把这个文件发给元宝\n"];
     [out appendString:@"================================================================\n\n"];
 
@@ -2168,7 +2168,7 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"        Swift 内部符号、服务端下发的动态脚本。\n"];
     [out appendString:@"如果报告里一片空白，说明广告全在这些层面，需要换侦察手段。\n\n"];
 
-    [out appendString:@"【六、能力清单（v19）】\n"];
+    [out appendString:@"【六、能力清单（v20）】\n"];
     [out appendString:@"A. 后台续跑（默认开，面板第一行「后台:开」）\n"];
     [out appendString:@"   v17 修正：v16 的 hook 一次都没装上 —— 启动第 3 秒 Cube/Nebula/Bee 这些类\n"];
     [out appendString:@"   还没被 dyld 加载，objc_getClass 返回 NULL，宏静默跳过。\n"];
@@ -2200,11 +2200,15 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"     CountdownButton  -setRemainingTime:(double) + -updateCountdown\n"];
     [out appendString:@"     AdRewardView     -countDownFinish               零参数\n"];
     [out appendString:@"     AdRewardedVideoView -countDownEnd               零参数\n"];
-    [out appendString:@"     BeeVideoPlayerView -seekToTime:(double) / -getCurrentTime\n\n"];
+    [out appendString:@"     BeeVideoPlayerView -seekToTime:(double) / -getCurrentTime\n"];
+    [out appendString:@"E. v20 前台快进（面板第二行「快进」按钮）\n"];
+    [out appendString:@"   只在广告在前台播放时有用：setPlaybackRate 16 + seekToTime 往后跳 13 秒。\n"];
+    [out appendString:@"   [FF] 记录快进前后位置。若秒数跟着跳、广告 1~2 秒内结束 → 成功。\n"];
+    [out appendString:@"   若快进后视频位置变了但广告/倒计时没动 → 奖励按真实停留计时，与视频进度无关。\n\n"];
 
     [out appendString:@"【七、生成信息】\n"];
     [out appendFormat:@"生成时间: %@\n", [NSDate date]];
-    [out appendFormat:@"插件版本: AdRecon v19\n"];
+    [out appendFormat:@"插件版本: AdRecon v20\n"];
     [out appendFormat:@"设备    : %@ / iOS %@\n",
      reconSysctlString(@"hw.machine") ?: @"?",
      [[UIDevice currentDevice] systemVersion]];
@@ -2235,7 +2239,7 @@ NSString *ReconWriteReportFile(void) {
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [formatter stringFromDate:[NSDate date]];
-    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v19-%@.txt", stamp];
+    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v20-%@.txt", stamp];
     NSString *path = [dir stringByAppendingPathComponent:fileName];
 
     NSError *error = nil;
@@ -2405,6 +2409,28 @@ static BOOL adCallRetB(id target, NSString *selName) {
         return NO;
     }
     return ((BOOL (*)(id, SEL))objc_msgSend)(target, sel);
+}
+
+/*
+    v20 前台快进：广告只在前台播放时，把视频往后跳 + 高倍速，
+    让 15 秒广告 1~2 秒走完。供浮窗「快进」按钮调用。
+*/
+void AdFastForwardRun(void) {
+    NSArray *players = adFindViews(@"BeeVideoPlayerView");
+    if (players.count == 0) {
+        reconLogF(@"[FF] 屏上没有 BeeVideoPlayerView（快进只对视频广告有效）");
+        reconBanner(@"快进：没找到视频播放器");
+        return;
+    }
+    for (id player in players) {
+        double before = adCallRetD(player, @"getCurrentTime");
+        adCallD(player, @"setPlaybackRate:", 16.0);
+        BOOL ok = adCallD(player, @"seekToTime:", before + 13.0);
+        double after = adCallRetD(player, @"getCurrentTime");
+        reconLogF(@"[FF] 快进 %.1fs → rate=16 seek=%@ → 现在 %.1fs",
+                  before, ok ? @"OK" : @"NO", after);
+    }
+    reconBanner(@"已快进");
 }
 
 /*
@@ -2816,9 +2842,10 @@ static void adPerformStep(NSString *step) {
             }
             for (id player in players) {
                 double before = adCallRetD(player, @"getCurrentTime");
-                BOOL ok = adCallD(player, @"seekToTime:", before + 600.0);
+                adCallD(player, @"setPlaybackRate:", 16.0);
+                BOOL ok = adCallD(player, @"seekToTime:", before + 13.0);
                 double after = adCallRetD(player, @"getCurrentTime");
-                reconLogF(@"[KILL] ②视频快进 %.1fs → seek=%@ → 现在 %.1fs",
+                reconLogF(@"[KILL] ②视频快进 %.1fs → rate=16 seek=%@ → 现在 %.1fs",
                           before, ok ? @"OK" : @"NO", after);
             }
             return;

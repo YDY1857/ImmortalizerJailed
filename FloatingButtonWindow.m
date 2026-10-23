@@ -121,6 +121,9 @@ extern void AdSetJSSpeed(BOOL enabled);
 /* 由 main.m 提供：后台续跑开关（v15） */
 extern BOOL AdBgKeepEnabled(void);
 extern void AdSetBgKeep(BOOL enabled);
+
+/* 由 main.m 提供：前台快进（v20） */
+extern void AdFastForwardRun(void);
 extern void AdPrimeBackgroundPlayback(void);
 
 /* 由 main.m 提供：往同一份报告里写一行（v16） */
@@ -166,6 +169,7 @@ extern void AdLog(NSString *message);
 - (void)adKillTapped;
 - (void)autoKillTapped;
 - (void)jsSpeedTapped;
+- (void)fastForwardTapped;
 - (void)bgKeepTapped;
 - (void)forceEnableKeepAlive;
 - (void)updateButtonColor;
@@ -557,7 +561,7 @@ static NSData *makeInaudibleWav(void) {
         textView.font = mono ?: [UIFont systemFontOfSize:10.0];
 
         UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w - 120, 34)];
-        titleLabel.text = @"AdRecon v19 后台续跑";
+        titleLabel.text = @"AdRecon v20 快进";
         titleLabel.textColor = [UIColor whiteColor];
         titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
 
@@ -573,9 +577,9 @@ static NSData *makeInaudibleWav(void) {
                                                 selectors:@[@"exportReportTapped", @"copyReportTapped", @"snapshotTapped", @"bgKeepTapped"]
                                                     frame:CGRectMake(10, row1Y, w - 20, 40)];
 
-        /* 第二行：秒过相关 */
-        UIStackView *row2 = [self buildButtonRowWithTitles:@[@"秒过广告", @"自动:关", @"JS加速:开"]
-                                                selectors:@[@"adKillTapped", @"autoKillTapped", @"jsSpeedTapped"]
+        /* 第二行：秒过 + 快进相关 */
+        UIStackView *row2 = [self buildButtonRowWithTitles:@[@"秒过广告", @"自动:关", @"JS加速:开", @"快进"]
+                                                selectors:@[@"adKillTapped", @"autoKillTapped", @"jsSpeedTapped", @"fastForwardTapped"]
                                                     frame:CGRectMake(10, row2Y, w - 20, 40)];
 
         UIButton *bgButton = (UIButton *)row1.arrangedSubviews[3];
@@ -702,6 +706,10 @@ static NSData *makeInaudibleWav(void) {
     } else {
         [self showSimpleToast:@"H5 加速已关 · 已打开的页面不受影响"];
     }
+}
+
+- (void)fastForwardTapped {
+    AdFastForwardRun();
 }
 
 - (void)adKillTapped {
@@ -832,22 +840,22 @@ static NSData *makeInaudibleWav(void) {
 
 - (NSString *)statusText {
     if (!self.isImmortalized) {
-        return @"v19 · 就绪（长按出面板）";
+        return @"v20 · 就绪（长按出面板）";
     }
     if (self.audioOK) {
         if (self.suspendedGap > 3.0) {
-            return [NSString stringWithFormat:@"v19 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
+            return [NSString stringWithFormat:@"v20 · 后台被挂起 %@", [self formatDuration:self.suspendedGap]];
         }
-        return @"v19 · 音频运行中";
+        return @"v20 · 音频运行中";
     }
     NSString *reason = self.audioLastError;
     if (reason.length == 0) {
-        return @"v19 · 音频未启动";
+        return @"v20 · 音频未启动";
     }
     if (reason.length > 22) {
         reason = [[reason substringToIndex:22] stringByAppendingString:@"…"];
     }
-    return [NSString stringWithFormat:@"v19 · 音频未启动 · %@", reason];
+    return [NSString stringWithFormat:@"v20 · 音频未启动 · %@", reason];
 }
 
 #pragma mark - 音频保活（iOS 27 修正版）
