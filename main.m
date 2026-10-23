@@ -16,6 +16,40 @@
 */
 
 /*
+    ===== 修改说明 v17（2026-10-22）v16 的 hook 根本没装上 =====
+
+    【v16 真机结果：进程活了，但拦截 0 次】
+    - [ALIVE] 心跳 31.20s / 89.85s 都在 → 后台 65 秒进程没被挂起，音频保活成功了。
+    - 但 [BG] ★ 拦截 一条都没有，倒计时照旧不动。
+
+    【根因：hook 装晚了，宏静默跳过】
+    报告里启动扫描到 714 个广告相关类，其中**没有** CubeViewNGImpl / CubeView /
+    BeeVideoPlayerView / CKPView —— 这些类要等小程序框架加载（约第 9.8 秒）才存在。
+    而 hook 是在第 3 秒装的，objc_getClass 返回 NULL，RECON_HOOK_I 直接跳过，
+    还不打日志。所以 v16 那几个"真正入口"从来没被挂上，零拦截不是"没触发"。
+
+    【v17 三件事】
+    1. 延迟补挂：每 2 秒重试一次（最多 5 分钟），装上一个写一行
+       [HOOK] ★ 已挂 类名 -方法名，报告开头就能核对到底挂上没挂上。
+       方法不存在会写 [HOOK] ✗，不再静默。
+    2. 暂停入口补全到四层：
+         Nebula 组件层  NBComponentManager / NBComponentManagerV2 -componentPause
+         小程序层      TinyAppConfigImpl -onPauseTinyApp:
+         渲染层        CubeViewNGImpl -onPause / CubeView -onPause
+         播放器层      BeeVideoPlayerView -audioSessionPause
+       componentDidRecivePauseOrResume:scene: 只观察不拦（成对调用，乱吞会状态错乱）。
+    3. 两个探针：
+         [TICK]  每 5 秒报 Nebula 定时泵（NBComponentTimerProxy -handleTimer:，
+                 0.07 秒一次）在后台的活动量。还在涨=JS 泵没停，卡的是渲染；
+                 不涨=泵被停了，继续往上层找。
+         [INVAL] 定时器被谁失效了（只记 TimerProxy/CKTimer/Render/Cube/NB 类 target）。
+
+    【证据】v16 报告第 9.84 秒有一条 0.07s repeats=1 NBComponentTimerProxy -handleTimer:，
+    第 90.33 秒（回前台）又新建了一条同名定时器 —— 说明后台期间它被停过又重建。
+
+*/
+
+/*
     ===== 修改说明 v16（2026-10-22）v15 猜错了对象 =====
 
     【v15 真机结果】
@@ -407,7 +441,7 @@ static void reconCollectEnv(void) {
     }
 
     @synchronized (gEnvLines) {
-        [gEnvLines addObject:@"扫描器        : AdRecon v16（后台续跑加强版）"];
+        [gEnvLines addObject:@"扫描器        : AdRecon v17（延迟补挂版）"];
         [gEnvLines addObject:[NSString stringWithFormat:@"采集开始      : %@", [NSDate date]]];
         [gEnvLines addObject:[NSString stringWithFormat:@"iOS 版本      : %@", device.systemVersion]];
         [gEnvLines addObject:[NSString stringWithFormat:@"设备型号      : %@", reconSysctlString(@"hw.machine") ?: @"?"]];
@@ -1255,6 +1289,188 @@ static void hook_rngEnterBackground(id self, SEL _cmd, id arg) {
     }
 }
 
+/*
+    v17 关键修正：v16 那批 hook 其实一次都没装上。
+    启动第 3 秒时 CubeViewNGImpl / BeeVideoPlayerView 这些类还没被 dyld 加载，
+    objc_getClass 返回 NULL，RECON_HOOK_I 静默跳过 —— 报告里零拦截不是"没触发"，是"压根没挂上"。
+    所以 v17 改成延迟补挂（每 2 秒重试一次，装上一个记一行），并把暂停入口补全到四层：
+        Nebula 组件层   NBComponentManager / NBComponentManagerV2 -componentPause
+        小程序层        TinyAppConfigImpl -onPauseTinyApp:
+        渲染层          CubeViewNGImpl -onPause / CubeView -onPause
+        播放器层        BeeVideoPlayerView -audioSessionPause
+*/
+static void (*orig_nbMgrPause)(id, SEL);
+static void hook_nbMgrPause(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 %@ -componentPause（Nebula 组件不暂停）", NSStringFromClass([self class]));
+        return;
+    }
+    if (orig_nbMgrPause) {
+        orig_nbMgrPause(self, _cmd);
+    }
+}
+
+static void (*orig_nbMgrPauseV2)(id, SEL);
+static void hook_nbMgrPauseV2(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 NBComponentManagerV2 -componentPause");
+        return;
+    }
+    if (orig_nbMgrPauseV2) {
+        orig_nbMgrPauseV2(self, _cmd);
+    }
+}
+
+/* 只观察不拦截：这个方法是暂停/恢复成对的，乱吞会让状态错乱。
+   先把参数打出来，看清到底是谁、因为什么被暂停。 */
+static NSUInteger gNbPauseSeen = 0;
+static void (*orig_nbPauseOrResume)(id, SEL, id, id);
+static void hook_nbPauseOrResume(id self, SEL _cmd, id arg1, id arg2) {
+    @try {
+        if (gNbPauseSeen < 24) {
+            gNbPauseSeen++;
+            reconLogF(@"[BG·观察] componentDidRecivePauseOrResume: %@ scene=%@",
+                      arg1, arg2);
+        }
+    } @catch (NSException *e) {
+        (void)e;
+    }
+    if (orig_nbPauseOrResume) {
+        orig_nbPauseOrResume(self, _cmd, arg1, arg2);
+    }
+}
+
+static void (*orig_tinyPause)(id, SEL, id);
+static void hook_tinyPause(id self, SEL _cmd, id arg) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 TinyAppConfigImpl -onPauseTinyApp:（小程序不暂停）");
+        return;
+    }
+    if (orig_tinyPause) {
+        orig_tinyPause(self, _cmd, arg);
+    }
+}
+
+/*
+    v17：Paladin（小游戏容器）层的隐藏开关。
+    PLDContainer / PLDJITContainer -onHide 就是"告诉 JS 我进后台了"，
+    JS 收到之后才开始停倒计时。拦掉它，JS 根本不知道你切走了。
+    isAppShow 强制为 YES，让容器自己认为仍在前台。
+*/
+static void (*orig_pldHide)(id, SEL);
+static void hook_pldHide(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 %@ -onHide（Paladin 容器不隐藏）", NSStringFromClass([self class]));
+        return;
+    }
+    if (orig_pldHide) {
+        orig_pldHide(self, _cmd);
+    }
+}
+
+static void (*orig_pldJitHide)(id, SEL);
+static void hook_pldJitHide(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        reconLogF(@"[BG] ★ 拦截 PLDJITContainer -onHide");
+        return;
+    }
+    if (orig_pldJitHide) {
+        orig_pldJitHide(self, _cmd);
+    }
+}
+
+static BOOL (*orig_pldIsAppShow)(id, SEL);
+static BOOL hook_pldIsAppShow(id self, SEL _cmd) {
+    if (AdBgKeepEnabled()) {
+        return YES;
+    }
+    return orig_pldIsAppShow ? orig_pldIsAppShow(self, _cmd) : YES;
+}
+
+/* 只观察：暂停音频不影响倒计时，但记下来能看出容器还做了哪些动作 */
+static void (*orig_pldPauseAudio)(id, SEL);
+static void hook_pldPauseAudio(id self, SEL _cmd) {
+    @try {
+        reconLogF(@"[BG·观察] %@ -pauseAudio", NSStringFromClass([self class]));
+    } @catch (NSException *e) {
+        (void)e;
+    }
+    if (orig_pldPauseAudio) {
+        orig_pldPauseAudio(self, _cmd);
+    }
+}
+
+/*
+    探针一：[TICK] Nebula 定时泵计数。
+    NBComponentTimerProxy -handleTimer: 是 Nebula 里所有 JS 定时器的驱动源（每 0.07 秒一次）。
+    后台期间它还在涨，说明 JS 泵没停，卡住的是渲染；不涨就是泵本身被停了。
+*/
+static volatile int gNbTickCount = 0;
+static void (*orig_nbTimerHandle)(id, SEL, id);
+static void hook_nbTimerHandle(id self, SEL _cmd, id timer) {
+    gNbTickCount++;
+    if (orig_nbTimerHandle) {
+        orig_nbTimerHandle(self, _cmd, timer);
+    }
+}
+
+/* 当前是否在后台（由 [LIFE] 生命周期观察者维护） */
+static BOOL gAppInBackground = NO;
+
+/*
+    探针二：[INVAL] 谁把定时器失效了。    只记 target 名字里带 TimerProxy / CKTimer / Render / Cube / NB 的，避免刷屏。
+    NSTimer 的真实实例是 __NSCFTimer（类簇），所以两个类都要挂。
+*/
+static void reconNoteTimerInvalidate(id timer) {
+    /* invalidate 调用极频繁，只在后台期间才做检查，避免拖慢主线程 */
+    if (!gAppInBackground) {
+        return;
+    }
+    @try {
+        id target = [timer valueForKey:@"target"];
+        if (target != nil) {
+            NSString *tc = NSStringFromClass([target class]);
+            if ([tc containsString:@"TimerProxy"] || [tc containsString:@"CKTimer"] ||
+                [tc containsString:@"Render"] || [tc containsString:@"Cube"] || [tc containsString:@"NB"]) {
+                reconLogF(@"[INVAL] 定时器被失效 · target=%@", tc);
+            }
+        }
+    } @catch (NSException *e) {
+        (void)e;
+    }
+}
+
+static void (*orig_timerInvalidate)(id, SEL);
+static void hook_timerInvalidate(id self, SEL _cmd) {
+    reconNoteTimerInvalidate(self);
+    if (orig_timerInvalidate) {
+        orig_timerInvalidate(self, _cmd);
+    }
+}
+
+static void (*orig_timerInvalidate2)(id, SEL);
+static void hook_timerInvalidate2(id self, SEL _cmd) {
+    reconNoteTimerInvalidate(self);
+    if (orig_timerInvalidate2) {
+        orig_timerInvalidate2(self, _cmd);
+    }
+}
+
+/* [TICK] 每 5 秒汇报一次 Nebula 定时泵的活动量 */
+static int gNbTickLast = 0;
+static void adTickReport(void) {
+    int now = gNbTickCount;
+    int delta = now - gNbTickLast;
+    gNbTickLast = now;
+    /* 注意：不能读 [UIApplication applicationState]，它被 v9 的 hook 强制成 Active 了，
+       所以"是否在后台"只能看生命周期通知维护的 gAppInBackground */
+    if (gAppInBackground) {
+        reconLogF(@"[TICK] Nebula 定时泵：5 秒内 +%d 次（后台中，>0 说明 JS 泵还活着）", delta);
+    } else if (delta == 0 && now > 0) {
+        reconLogF(@"[TICK] Nebula 定时泵：5 秒内 0 次（前台也停了，异常）");
+    }
+}
+
 static void (*orig_cubePause)(id, SEL);
 static void hook_cubePause(id self, SEL _cmd) {
     if (AdBgKeepEnabled()) {
@@ -1469,6 +1685,91 @@ static void reconHookURLSessionTasks(void) {
     free(classes);
 }
 
+#pragma mark - 延迟补挂（v17 核心修正）
+
+static NSMutableSet<NSString *> *gDeferredDone = nil;
+static NSMutableSet<NSString *> *gDeferredFailed = nil;
+static int gDeferredRounds = 0;
+static BOOL gDeferredAllLogged = NO;
+
+/* 装一个：类没加载就安静等下一轮，方法不存在才记一行，装上就记一行 */
+static void reconTryHookOnce(NSString *clsName, NSString *selStr, IMP hookIMP, void **slot) {
+    if (gDeferredDone == nil) {
+        gDeferredDone = [NSMutableSet set];
+    }
+    NSString *key = [NSString stringWithFormat:@"%@|%@", clsName, selStr];
+    if ([gDeferredDone containsObject:key]) {
+        return;
+    }
+
+    Class cls = objc_getClass(clsName.UTF8String);
+    if (cls == NULL) {
+        return;
+    }
+
+    Method m = class_getInstanceMethod(cls, sel_getUid(selStr.UTF8String));
+    if (m == NULL) {
+        if (gDeferredFailed == nil) {
+            gDeferredFailed = [NSMutableSet set];
+        }
+        if (![gDeferredFailed containsObject:key]) {
+            [gDeferredFailed addObject:key];
+            reconLogF(@"[HOOK] ✗ %@ 里没有 -%@", clsName, selStr);
+        }
+        return;
+    }
+
+    if (*slot == NULL) {
+        *slot = (void *)method_getImplementation(m);
+        method_setImplementation(m, hookIMP);
+    }
+    [gDeferredDone addObject:key];
+    reconLogF(@"[HOOK] ★ 已挂 %@ -%@", clsName, selStr);
+}
+
+static void reconInstallDeferredHooks(void) {
+    gDeferredRounds++;
+
+    /* Nebula 组件层：小程序里所有组件的暂停总开关 */
+    reconTryHookOnce(@"NBComponentManager", @"componentPause", (IMP)hook_nbMgrPause, (void **)&orig_nbMgrPause);
+    reconTryHookOnce(@"NBComponentManagerV2", @"componentPause", (IMP)hook_nbMgrPauseV2, (void **)&orig_nbMgrPauseV2);
+    reconTryHookOnce(@"NBComponentManager", @"componentDidRecivePauseOrResume:scene:", (IMP)hook_nbPauseOrResume, (void **)&orig_nbPauseOrResume);
+
+    /* 小程序层 */
+    reconTryHookOnce(@"TinyAppConfigImpl", @"onPauseTinyApp:", (IMP)hook_tinyPause, (void **)&orig_tinyPause);
+
+    /* Paladin 小游戏容器层：告诉 JS "进后台了" 的就是这里 */
+    reconTryHookOnce(@"PLDContainer", @"onHide", (IMP)hook_pldHide, (void **)&orig_pldHide);
+    reconTryHookOnce(@"PLDJITContainer", @"onHide", (IMP)hook_pldJitHide, (void **)&orig_pldJitHide);
+    reconTryHookOnce(@"PLDContainer", @"isAppShow", (IMP)hook_pldIsAppShow, (void **)&orig_pldIsAppShow);
+    reconTryHookOnce(@"PLDContainer", @"pauseAudio", (IMP)hook_pldPauseAudio, (void **)&orig_pldPauseAudio);
+
+    /* 渲染层 */
+    reconTryHookOnce(@"CubeViewNGImpl", @"onPause", (IMP)hook_cubeNGPause, (void **)&orig_cubeNGPause);
+    reconTryHookOnce(@"CubeView", @"onPause", (IMP)hook_cubeViewPause, (void **)&orig_cubeViewPause);
+    reconTryHookOnce(@"RNGPreloadInstance", @"handleEnterBackground:", (IMP)hook_rngEnterBackground, (void **)&orig_rngEnterBackground);
+    reconTryHookOnce(@"ALTCubeEventHandler", @"onContainerPause", (IMP)hook_cubePause, (void **)&orig_cubePause);
+    reconTryHookOnce(@"ALTCubeEventHandler", @"onContainerViewDidDisappear", (IMP)hook_cubeDisappear, (void **)&orig_cubeDisappear);
+
+    /* 播放器层 */
+    reconTryHookOnce(@"BeeVideoPlayerView", @"audioSessionPause", (IMP)hook_beeAudioPause, (void **)&orig_beeAudioPause);
+    reconTryHookOnce(@"BeeVideoPlayerView", @"audioSessionPauseFromNotification", (IMP)hook_beeAudioPauseNote, (void **)&orig_beeAudioPauseNote);
+    reconTryHookOnce(@"BeeAudioSessionManager4Video", @"systemRequestResignActive:", (IMP)hook_beeSysResign, (void **)&orig_beeSysResign);
+
+    /* 两个探针 */
+    reconTryHookOnce(@"NBComponentTimerProxy", @"handleTimer:", (IMP)hook_nbTimerHandle, (void **)&orig_nbTimerHandle);
+    reconTryHookOnce(@"NSTimer", @"invalidate", (IMP)hook_timerInvalidate, (void **)&orig_timerInvalidate);
+    reconTryHookOnce(@"__NSCFTimer", @"invalidate", (IMP)hook_timerInvalidate2, (void **)&orig_timerInvalidate2);
+
+    if (gDeferredRounds == 1) {
+        reconLogF(@"[HOOK] 第 1 轮补挂：已装 %lu/19（没装上的等类加载后自动补）",
+                  (unsigned long)gDeferredDone.count);
+    } else if (!gDeferredAllLogged && gDeferredDone.count >= 19) {
+        gDeferredAllLogged = YES;
+        reconLogF(@"[HOOK] ★ 19 个补挂全部完成（第 %d 轮）", gDeferredRounds);
+    }
+}
+
 #pragma mark - Hook 安装
 
 /* 定义在下面的广告秒过模块里，这里先声明（否则顺序上找不到） */
@@ -1522,25 +1823,9 @@ static void reconInstallHooks(void) {
         reconLogF(@"[INIT] WebView 初始化 hook 异常：%@", e.reason ?: @"?");
     }
 
-    /* 后台续跑（v15）：拦住小游戏页面自己的"进后台就暂停" */
-    @try {
-        RECON_HOOK_I("RNGPreloadInstance", "handleEnterBackground:", hook_rngEnterBackground, orig_rngEnterBackground);
-        RECON_HOOK_I("ALTCubeEventHandler", "onContainerPause", hook_cubePause, orig_cubePause);
-        RECON_HOOK_I("ALTCubeEventHandler", "onContainerViewDidDisappear", hook_cubeDisappear, orig_cubeDisappear);
-    } @catch (NSException *e) {
-        reconLogF(@"[INIT] 后台续跑 hook 异常：%@", e.reason ?: @"?");
-    }
-
-    /* 后台续跑（v16）：这才是真正被走到的暂停入口 */
-    @try {
-        RECON_HOOK_I("CubeViewNGImpl", "onPause", hook_cubeNGPause, orig_cubeNGPause);
-        RECON_HOOK_I("CubeView", "onPause", hook_cubeViewPause, orig_cubeViewPause);
-        RECON_HOOK_I("BeeVideoPlayerView", "audioSessionPause", hook_beeAudioPause, orig_beeAudioPause);
-        RECON_HOOK_I("BeeVideoPlayerView", "audioSessionPauseFromNotification", hook_beeAudioPauseNote, orig_beeAudioPauseNote);
-        RECON_HOOK_I("BeeAudioSessionManager4Video", "systemRequestResignActive:", hook_beeSysResign, orig_beeSysResign);
-    } @catch (NSException *e) {
-        reconLogF(@"[INIT] v16 暂停 hook 异常：%@", e.reason ?: @"?");
-    }
+    /* 后台续跑相关的一律走延迟补挂（见 reconInstallDeferredHooks），
+       因为 Cube / Nebula / Bee 这些类要等小程序框架加载后才存在 */
+    reconInstallDeferredHooks();
 
     if (!installed) {
         installed = YES;
@@ -1738,7 +2023,7 @@ static NSString *reconReportTextInternal(void) {
     NSMutableString *out = [NSMutableString string];
 
     [out appendString:@"================================================================\n"];
-    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v16）\n"];
+    [out appendString:@"   支付宝广告 · 侦察 + 秒过报告（AdRecon v17）\n"];
     [out appendString:@"   由注入版 dylib 自动生成，直接把这个文件发给元宝\n"];
     [out appendString:@"================================================================\n\n"];
 
@@ -1828,30 +2113,33 @@ static NSString *reconReportTextInternal(void) {
     [out appendString:@"        Swift 内部符号、服务端下发的动态脚本。\n"];
     [out appendString:@"如果报告里一片空白，说明广告全在这些层面，需要换侦察手段。\n\n"];
 
-    [out appendString:@"【六、能力清单（v16）】\n"];
+    [out appendString:@"【六、能力清单（v17）】\n"];
     [out appendString:@"A. 后台续跑（默认开，面板第一行「后台:开」）\n"];
-    [out appendString:@"   拦 CubeViewNGImpl -onPause（v16 真正被走到的入口）\n"];
-    [out appendString:@"   拦 CubeView -onPause / BeeVideoPlayerView -audioSessionPause\n"];
+    [out appendString:@"   v17 修正：v16 的 hook 一次都没装上 —— 启动第 3 秒 Cube/Nebula/Bee 这些类\n"];
+    [out appendString:@"   还没被 dyld 加载，objc_getClass 返回 NULL，宏静默跳过。\n"];
+    [out appendString:@"   现在每 2 秒重试补挂，装上一个记一行 [HOOK] ★ 已挂，报告开头就能核对。\n"];
+    [out appendString:@"   拦 NBComponentManager   -componentPause（Nebula 组件总开关）\n"];
+    [out appendString:@"   拦 NBComponentManagerV2 -componentPause\n"];
+    [out appendString:@"   拦 TinyAppConfigImpl    -onPauseTinyApp:（小程序层）\n"];
+    [out appendString:@"   拦 CubeViewNGImpl / CubeView -onPause（渲染层）\n"];
+    [out appendString:@"   拦 BeeVideoPlayerView -audioSessionPause / -audioSessionPauseFromNotification\n"];
     [out appendString:@"   拦 BeeAudioSessionManager4Video -systemRequestResignActive:\n"];
-    [out appendString:@"   拦 RNGPreloadInstance -handleEnterBackground:（v15 保留）\n"];
-    [out appendString:@"   对 BeeVideoPlayerView 调 -setEnableBackgroudPlay:YES\n"];
-    [out appendString:@"   检测到播放器就自动开音频保活（v16 改为直接调用，不等通知）\n"];
-    [out appendString:@"   诊断：[LIFE] 生命周期、[ALIVE] 30 秒心跳（有心跳=进程没被挂起）\n"];
-    [out appendString:@"B. 秒过（面板第二行「秒过广告」）\n"];
-    [out appendString:@"   静态分析自 AlipayWallet 12.12.30 的 __objc_methtype，签名已核对：\n"];
+    [out appendString:@"   拦 RNGPreloadInstance -handleEnterBackground:\n"];
+    [out appendString:@"   只观察不拦：componentDidRecivePauseOrResume:scene:（暂停/恢复成对，乱吞会错乱）\n"];
+    [out appendString:@"B. 两个新探针\n"];
+    [out appendString:@"   [TICK] 每 5 秒报一次 Nebula 定时泵活动量。后台还在涨=JS 泵没停（卡的是渲染）；\n"];
+    [out appendString:@"          不涨=泵本身被停了，那就继续往上层找。\n"];
+    [out appendString:@"   [INVAL] 谁把定时器失效了（只记 TimerProxy/CKTimer/Render/Cube/NB 这几类 target）。\n"];
+    [out appendString:@"C. 秒过（面板第二行「秒过广告」，本次测试不用点）\n"];
     [out appendString:@"     AdOpenScreenView -exitAd / -exiAdWhenTimeOver   零参数\n"];
     [out appendString:@"     CountdownButton  -setRemainingTime:(double) + -updateCountdown\n"];
     [out appendString:@"     AdRewardView     -countDownFinish               零参数\n"];
     [out appendString:@"     AdRewardedVideoView -countDownEnd               零参数\n"];
-    [out appendString:@"     BeeVideoPlayerView -seekToTime:(double) / -getCurrentTime\n"];
-    [out appendString:@"   顺序：①后台预热 ②倒计时归零 ③视频快进 ④再快进 ⑤探针 ⑥激励结束\n"];
-    [out appendString:@"         ⑦激励视频结束 ⑧开屏时间到 ⑨开屏退出 ⑩H5补刀 ⑪H5自检\n"];
-    [out appendString:@"探针：[PROBE] 广告条命中的类名链，[CLASS] 命中类的方法表。\n"];
-    [out appendString:@"自检：[H5·自检#n] 读回 speed=1 才说明加速脚本真跑了（v14 全是 0）。\n\n"];
+    [out appendString:@"     BeeVideoPlayerView -seekToTime:(double) / -getCurrentTime\n\n"];
 
     [out appendString:@"【七、生成信息】\n"];
     [out appendFormat:@"生成时间: %@\n", [NSDate date]];
-    [out appendFormat:@"插件版本: AdRecon v16\n"];
+    [out appendFormat:@"插件版本: AdRecon v17\n"];
     [out appendFormat:@"设备    : %@ / iOS %@\n",
      reconSysctlString(@"hw.machine") ?: @"?",
      [[UIDevice currentDevice] systemVersion]];
@@ -1882,7 +2170,7 @@ NSString *ReconWriteReportFile(void) {
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [formatter stringFromDate:[NSDate date]];
-    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v16-%@.txt", stamp];
+    NSString *fileName = [NSString stringWithFormat:@"AdRecon-v17-%@.txt", stamp];
     NSString *path = [dir stringByAppendingPathComponent:fileName];
 
     NSError *error = nil;
@@ -2673,6 +2961,22 @@ static void setup() {
             adAutoKillTick();
             adBgKeepTick();
         }];
+
+        // 6.6 v17 延迟补挂：Cube/Nebula/Bee 这些类要等小程序框架加载后才存在，
+        //     每 2 秒重试一次，最多 5 分钟（装上一个记一行 [HOOK]）
+        [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
+            if (gDeferredRounds > 150) {
+                [timer invalidate];
+                return;
+            }
+            reconInstallDeferredHooks();
+        }];
+
+        // 6.7 探针：[TICK] Nebula 定时泵还活不活
+        [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES block:^(NSTimer *timer) {
+            (void)timer;
+            adTickReport();
+        }];
         gInternalTimerGuard = NO;
 
         // 7. 前后台生命周期全部记下来 + 立刻落盘（判断"进程有没有活下来"的唯一依据）
@@ -2686,6 +2990,13 @@ static void setup() {
                                                                queue:[NSOperationQueue mainQueue]
                                                           usingBlock:^(NSNotification *note) {
                 reconLogF(@"[LIFE] %@", note.name);
+                if ([note.name isEqualToString:UIApplicationWillResignActiveNotification] ||
+                    [note.name isEqualToString:UIApplicationDidEnterBackgroundNotification]) {
+                    gAppInBackground = YES;
+                } else {
+                    gAppInBackground = NO;
+                    reconLogF(@"[TICK] 回到前台，Nebula 定时泵累计 %d 次", gNbTickCount);
+                }
                 gDirty = YES;
                 reconAutoFlush();
             }];
